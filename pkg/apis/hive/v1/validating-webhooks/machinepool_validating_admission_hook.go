@@ -222,6 +222,7 @@ func validateMachinePoolUpdate(old, new *hivev1.MachinePool) field.ErrorList {
 	allErrs = append(allErrs, validation.ValidateImmutableField(new.Spec.Name, old.Spec.Name, specPath.Child("name"))...)
 	allErrs = append(allErrs, validation.ValidateImmutableField(new.Spec.Labels, old.Spec.Labels, specPath.Child("labels"))...)
 	allErrs = append(allErrs, validation.ValidateImmutableField(new.Spec.Taints, old.Spec.Taints, specPath.Child("taints"))...)
+	allErrs = append(allErrs, validation.ValidateImmutableField(new.Spec.Platform, old.Spec.Platform, specPath.Child("platform"))...)
 	return allErrs
 }
 
@@ -269,9 +270,6 @@ func validateMachinePoolSpecInvariants(spec *hivev1.MachinePoolSpec, fldPath *fi
 	}
 	if p := spec.Platform.GCP; p != nil {
 		platforms = append(platforms, "gcp")
-		if spec.Name != defaultWorkerPoolName {
-			allErrs = append(allErrs, field.NotSupported(fldPath.Child("name"), spec.Name, []string{defaultWorkerPoolName}))
-		}
 		allErrs = append(allErrs, validateGCPMachinePoolPlatformInvariants(p, platformPath.Child("gcp"))...)
 		numberOfMachineSets = len(p.Zones)
 	}
@@ -279,9 +277,6 @@ func validateMachinePoolSpecInvariants(spec *hivev1.MachinePoolSpec, fldPath *fi
 		platforms = append(platforms, "azure")
 		allErrs = append(allErrs, validateAzureMachinePoolPlatformInvariants(p, platformPath.Child("azure"))...)
 		numberOfMachineSets = len(p.Zones)
-	}
-	if spec.Platform.BareMetal != nil {
-		platforms = append(platforms, "baremetal")
 	}
 	switch len(platforms) {
 	case 0:
@@ -322,11 +317,11 @@ func validateAWSMachinePoolPlatformInvariants(platform *hivev1aws.MachinePoolPla
 	}
 	rootVolume := &platform.EC2RootVolume
 	rootVolumePath := fldPath.Child("ec2RootVolume")
-	if rootVolume.IOPS <= 0 {
-		allErrs = append(allErrs, field.Invalid(rootVolumePath.Child("iops"), rootVolume.IOPS, "volume IOPS must be positive"))
+	if rootVolume.IOPS < 0 {
+		allErrs = append(allErrs, field.Invalid(rootVolumePath.Child("iops"), rootVolume.IOPS, "volume IOPS must not be negative"))
 	}
-	if rootVolume.Size <= 0 {
-		allErrs = append(allErrs, field.Invalid(rootVolumePath.Child("size"), rootVolume.IOPS, "volume size must be positive"))
+	if rootVolume.Size < 0 {
+		allErrs = append(allErrs, field.Invalid(rootVolumePath.Child("size"), rootVolume.Size, "volume size must not be negative"))
 	}
 	if rootVolume.Type == "" {
 		allErrs = append(allErrs, field.Required(rootVolumePath.Child("type"), "volume type is required"))

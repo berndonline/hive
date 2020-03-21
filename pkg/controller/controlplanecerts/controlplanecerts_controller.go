@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"fmt"
 	"io"
+	"net/url"
 	"sort"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	"github.com/openshift/hive/pkg/constants"
 	hivemetrics "github.com/openshift/hive/pkg/controller/metrics"
 	controllerutils "github.com/openshift/hive/pkg/controller/utils"
+	"github.com/openshift/hive/pkg/remoteclient"
 	"github.com/openshift/hive/pkg/resource"
 )
 
@@ -66,11 +68,16 @@ func Add(mgr manager.Manager) error {
 func NewReconciler(mgr manager.Manager) reconcile.Reconciler {
 	logger := log.WithField("controller", controllerName)
 	helper := resource.NewHelperWithMetricsFromRESTConfig(mgr.GetConfig(), controllerName, logger)
-	return &ReconcileControlPlaneCerts{
+	r := &ReconcileControlPlaneCerts{
 		Client:  controllerutils.NewClientWithMetricsOrDie(mgr, controllerName),
 		scheme:  mgr.GetScheme(),
 		applier: helper,
 	}
+	r.remoteClientBuilder = func(cd *hivev1.ClusterDeployment) remoteclient.Builder {
+		return remoteclient.NewBuilder(r.Client, cd, controllerName)
+	}
+
+	return r
 }
 
 // AddToManager adds a new Controller to mgr with r as the reconcile.Reconciler
@@ -95,8 +102,9 @@ var _ reconcile.Reconciler = &ReconcileControlPlaneCerts{}
 // ReconcileControlPlaneCerts reconciles a ClusterDeployment object
 type ReconcileControlPlaneCerts struct {
 	client.Client
-	scheme  *runtime.Scheme
-	applier applier
+	scheme              *runtime.Scheme
+	applier             applier
+	remoteClientBuilder func(*hivev1.ClusterDeployment) remoteclient.Builder
 }
 
 // Reconcile reads that state of the cluster for a ClusterDeployment object and makes changes based on the state read
@@ -130,8 +138,12 @@ func (r *ReconcileControlPlaneCerts) Reconcile(request reconcile.Request) (recon
 		return reconcile.Result{}, nil
 	}
 
+	if !cd.Spec.Installed {
+		return reconcile.Result{}, nil
+	}
+
 	existingSyncSet := &hivev1.SyncSet{}
-	existingSyncSetNamespacedName := types.NamespacedName{Namespace: cd.Namespace, Name: controlPlaneCertsSyncSetName(cd.Name)}
+	existingSyncSetNamespacedName := types.NamespacedName{Namespace: cd.Namespace, Name: GenerateControlPlaneCertsSyncSetName(cd.Name)}
 	err = r.Get(context.TODO(), existingSyncSetNamespacedName, existingSyncSet)
 	if err != nil && !apierrors.IsNotFound(err) {
 		cdLog.WithError(err).Error("failed to retrieve existing control plane certs syncset")
@@ -240,7 +252,7 @@ func (r *ReconcileControlPlaneCerts) generateControlPlaneCertsSyncSet(cd *hivev1
 	cdLog.Debug("generating syncset for control plane secrets")
 	syncSet := &hivev1.SyncSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      controlPlaneCertsSyncSetName(cd.Name),
+			Name:      GenerateControlPlaneCertsSyncSetName(cd.Name),
 			Namespace: cd.Namespace,
 		},
 		Spec: hivev1.SyncSetSpec{
@@ -282,12 +294,16 @@ func (r *ReconcileControlPlaneCerts) generateControlPlaneCertsSyncSet(cd *hivev1
 	additionalCerts := cd.Spec.ControlPlaneConfig.ServingCertificates.Additional
 	if cd.Spec.ControlPlaneConfig.ServingCertificates.Default != "" {
 		cdLog.Debug("setting default serving certificate for control plane")
-		if cd.Status.APIURL == "" {
-			return nil, errors.New("API URL not set in ClusterDeployment")
+
+		apidomain, err := r.defaultControlPlaneDomain(cd)
+		if err != nil {
+			cdLog.WithError(err).Error("failed to get control plane domain")
+			return nil, err
 		}
+
 		cpCert := hivev1.ControlPlaneAdditionalCertificate{
 			Name:   cd.Spec.ControlPlaneConfig.ServingCertificates.Default,
-			Domain: cd.Status.APIURL,
+			Domain: apidomain,
 		}
 		additionalCerts = append([]hivev1.ControlPlaneAdditionalCertificate{cpCert}, additionalCerts...)
 	}
@@ -361,6 +377,23 @@ func (r *ReconcileControlPlaneCerts) setCertsNotFoundCondition(cd *hivev1.Cluste
 	return true, r.Status().Update(context.TODO(), cd)
 }
 
+// defaultControlPlaneDomain will attempt to return the domain/hostname for the secondary API URL
+// for the cluster based on the contents of the clusterDeployment's adminKubeConfig secret.
+func (r *ReconcileControlPlaneCerts) defaultControlPlaneDomain(cd *hivev1.ClusterDeployment) (string, error) {
+	remoteClient := r.remoteClientBuilder(cd)
+
+	apiurl, err := remoteClient.UseSecondaryAPIURL().APIURL()
+	if err != nil {
+		return "", errors.Wrap(err, "failed to fetch secondary API URL")
+	}
+
+	u, err := url.Parse(apiurl)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse cluster's API URL")
+	}
+	return u.Hostname(), nil
+}
+
 func remoteSecretName(secretName string, cd *hivev1.ClusterDeployment) string {
 	return apihelpers.GetResourceName(cd.Name, secretName)
 }
@@ -374,8 +407,9 @@ func certificateBundle(cd *hivev1.ClusterDeployment, name string) *hivev1.Certif
 	return nil
 }
 
-func controlPlaneCertsSyncSetName(name string) string {
-	return apihelpers.GetResourceName(name, "cp-certs")
+// GenerateControlPlaneCertsSyncSetName generates the name of the SyncSet that holds the control plane certificates to sync.
+func GenerateControlPlaneCertsSyncSetName(name string) string {
+	return apihelpers.GetResourceName(name, constants.ControlPlaneCertificateSuffix)
 }
 
 func writeSecretData(w io.Writer, secret *corev1.Secret) {

@@ -11,6 +11,10 @@ const (
 	// VeleroBackupEnvVar is the name of the environment variable used to tell the controller manager to enable velero backup integration.
 	VeleroBackupEnvVar = "HIVE_VELERO_BACKUP"
 
+	// DeprovisionsDisabledEnvVar is the name of the environment variable used to tell the controller manager to skip
+	// processing of any ClusterDeprovisions.
+	DeprovisionsDisabledEnvVar = "DEPROVISIONS_DISABLED"
+
 	// MinBackupPeriodSecondsEnvVar is the name of the environment variable used to tell the controller manager the minimum period of time between backups.
 	MinBackupPeriodSecondsEnvVar = "HIVE_MIN_BACKUP_PERIOD_SECONDS"
 
@@ -26,6 +30,9 @@ const (
 
 	// UninstallJobLabel is the label used for artifacts specific to Hive cluster deprovision.
 	UninstallJobLabel = "hive.openshift.io/uninstall"
+
+	// MachinePoolNameLabel is the label that is used to identify the MachinePool which owns a particular resource.
+	MachinePoolNameLabel = "hive.openshift.io/machine-pool-name"
 
 	// ClusterDeploymentNameLabel is the label that is used to identify a relationship to a given cluster deployment object.
 	ClusterDeploymentNameLabel = "hive.openshift.io/cluster-deployment-name"
@@ -102,14 +109,31 @@ const (
 	// SyncsetPauseAnnotation is a annotation used by clusterDeployment, if it's true, then we will disable syncing to a specific cluster
 	SyncsetPauseAnnotation = "hive.openshift.io/syncset-pause"
 
+	// DisableInstallLogPasswordRedactionAnnotation is an annotation used on ClusterDeployments to disable the installmanager
+	// functionality which refuses to print output if it appears to contain a password or sensitive info. This can be
+	// useful in scenarios where debugging is needed and important info is being redacted. Set to "true".
+	DisableInstallLogPasswordRedactionAnnotation = "hive.openshift.io/disable-install-log-password-redaction"
+
+	// PauseOnInstallFailureAnnotation is an annotation used on ClusterDeployments to trigger a sleep after an install
+	// failure for the specified duration. This will keep the install pod running and allow a user to rsh in for debug
+	// purposes. Examples: "1h", "20m".
+	PauseOnInstallFailureAnnotation = "hive.openshift.io/pause-on-install-failure"
+
 	// ManagedDomainsFileEnvVar if present, points to a simple text
 	// file that includes a valid managed domain per line. Cluster deployments
 	// requesting that their domains be managed must have a base domain
 	// that is a direct child of one of the valid domains.
 	ManagedDomainsFileEnvVar = "MANAGED_DOMAINS_FILE"
 
+	// ManagedDomainsVolumeName is the name of the volume that will point
+	// to the configmap containing the managed domain configuration.
+	ManagedDomainsVolumeName = "managed-domains"
+
 	// GCPCredentialsName is the name of the GCP credentials file or secret key.
 	GCPCredentialsName = "osServiceAccount.json"
+
+	// AzureCredentialsName is the name of the Azure credentials file or secret key.
+	AzureCredentialsName = "osServicePrincipal.json"
 
 	// SSHPrivKeyPathEnvVar is the environment variable Hive will set for the installmanager pod to point to the
 	// path where we mount in the SSH key to be configured on the cluster hosts.
@@ -118,6 +142,33 @@ const (
 	// LibvirtSSHPrivKeyPathEnvVar is the environment variable Hive will set for the installmanager pod to point to the
 	// path where we mount in the SSH key for connecting to the bare metal libvirt provisioning host.
 	LibvirtSSHPrivKeyPathEnvVar = "LIBVIRT_SSH_PRIV_KEY_PATH"
+
+	// ControlPlaneCertificateSuffix is the suffix used when naming objects having to do control plane certificates.
+	ControlPlaneCertificateSuffix = "cp-certs"
+
+	// ClusterIngressSuffix is the suffix used when naming objects having to do with cluster ingress.
+	ClusterIngressSuffix = "clusteringress"
+
+	// IdentityProviderSuffix is the suffix used when naming objects having to do with identity provider
+	IdentityProviderSuffix = "idp"
+
+	// KubeconfigSecretKey is the key used inside of a secret containing a kubeconfig
+	KubeconfigSecretKey = "kubeconfig"
+
+	// UsernameSecretKey is a key used to store a username inside of a secret containing username / password credentials
+	UsernameSecretKey = "username"
+
+	// PasswordSecretKey is a key used to store a password inside of a secret containing username / password credentials
+	PasswordSecretKey = "password"
+
+	// AWSRoute53Region is the region to use for route53 operations.
+	AWSRoute53Region = "us-east-1"
+
+	// AWSChinaRoute53Region is the region to use for AWS China route53 operations.
+	AWSChinaRoute53Region = "cn-northwest-1"
+
+	// AWSChinaRegionPrefix is the prefix for regions in AWS China.
+	AWSChinaRegionPrefix = "cn-"
 )
 
 // GetMergedPullSecretName returns name for merged pull secret name per cluster deployment

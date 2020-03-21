@@ -51,7 +51,6 @@ const (
 	testNamespace           = "default"
 	testSyncsetInstanceName = "testSSI"
 	metadataName            = "foo-lqmsh-metadata"
-	sshKeySecret            = "ssh-key"
 	pullSecretSecret        = "pull-secret"
 	globalPullSecret        = "global-pull-secret"
 	adminKubeconfigSecret   = "foo-lqmsh-admin-kubeconfig"
@@ -123,7 +122,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 			existing: []runtime.Object{
 				testClusterDeploymentWithoutFinalizer(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				cd := getCD(c)
@@ -138,7 +136,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testClusterDeployment(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			expectPendingCreation: true,
 			validate: func(c client.Client, t *testing.T) {
@@ -158,7 +155,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testClusterDeployment(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			pendingCreation:       true,
 			expectPendingCreation: true,
@@ -174,7 +170,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testProvision(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				cd := getCD(c)
@@ -192,7 +187,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testProvision(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				cd := getCD(c)
@@ -217,7 +211,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 				testMetadataConfigMap(),
 			},
 			expectConsoleRouteFetch: true,
@@ -242,7 +235,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 				testMetadataConfigMap(),
 			},
 			expectConsoleRouteFetch: true,
@@ -250,6 +242,59 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				cd := getCD(c)
 				assert.Equal(t, "https://bar-api.clusters.example.com:6443", cd.Status.APIURL)
 				assert.Equal(t, "https://bar-api.clusters.example.com:6443/console", cd.Status.WebConsoleURL)
+			},
+		},
+		{
+			name: "Add additional CAs to admin kubeconfig",
+			existing: []runtime.Object{
+				testClusterDeploymentWithProvision(),
+				testSuccessfulProvision(),
+				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
+				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
+				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
+				testMetadataConfigMap(),
+			},
+			expectConsoleRouteFetch: true,
+			validate: func(c client.Client, t *testing.T) {
+				// Ensure the admin kubeconfig secret got a copy of the raw data, indicating that we would have
+				// added additional CAs if any were configured.
+				akcSecret := &corev1.Secret{}
+				err := c.Get(context.TODO(), client.ObjectKey{Name: adminKubeconfigSecret, Namespace: testNamespace},
+					akcSecret)
+				require.NoError(t, err)
+				require.NotNil(t, akcSecret)
+				assert.Contains(t, akcSecret.Data, rawAdminKubeconfigKey)
+			},
+		},
+		{
+			name: "Add additional CAs to admin kubeconfig when status URLs set",
+			existing: []runtime.Object{
+				func() *hivev1.ClusterDeployment {
+					cd := testClusterDeployment()
+					cd.Spec.Installed = true
+					cd.Spec.ClusterMetadata = &hivev1.ClusterMetadata{
+						InfraID:                  "fakeinfra",
+						AdminKubeconfigSecretRef: corev1.LocalObjectReference{Name: adminKubeconfigSecret},
+					}
+					cd.Status.WebConsoleURL = "https://example.com"
+					cd.Status.APIURL = "https://example.com"
+					return cd
+				}(),
+				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
+				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
+				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
+				testMetadataConfigMap(),
+			},
+			expectConsoleRouteFetch: false,
+			validate: func(c client.Client, t *testing.T) {
+				// Ensure the admin kubeconfig secret got a copy of the raw data, indicating that we would have
+				// added additional CAs if any were configured.
+				akcSecret := &corev1.Secret{}
+				err := c.Get(context.TODO(), client.ObjectKey{Name: adminKubeconfigSecret, Namespace: testNamespace},
+					akcSecret)
+				require.NoError(t, err)
+				require.NotNil(t, akcSecret)
+				assert.Contains(t, akcSecret.Data, rawAdminKubeconfigKey)
 			},
 		},
 		{
@@ -261,7 +306,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			expectConsoleRouteFetch: true,
 			validate: func(c client.Client, t *testing.T) {
@@ -280,7 +324,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				pvc := &corev1.PersistentVolumeClaim{}
@@ -303,7 +346,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				pvc := &corev1.PersistentVolumeClaim{}
@@ -324,7 +366,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				pvc := &corev1.PersistentVolumeClaim{}
@@ -353,7 +394,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 		},
 		{
@@ -362,7 +402,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testDeletedClusterDeploymentWithoutFinalizer(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				deprovision := getDeprovision(c)
@@ -385,7 +424,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				deprovision := getDeprovision(c)
@@ -400,7 +438,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testExpiredClusterDeployment(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				cd := getCD(c)
@@ -420,7 +457,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				cd := getCD(c)
@@ -442,7 +478,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				deprovision := getDeprovision(c)
@@ -463,7 +498,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testClusterImageSet(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				job := getImageSetJob(c)
@@ -502,7 +536,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testCompletedImageSetJob(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			expectPendingCreation: true,
 			validate: func(c client.Client, t *testing.T) {
@@ -524,7 +557,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testClusterImageSet(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				job := getImageSetJob(c)
@@ -558,7 +590,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			expectPendingCreation: true,
 			validate: func(c client.Client, t *testing.T) {
@@ -594,7 +625,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				zone := getDNSZone(c)
@@ -613,7 +643,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 				testDNSZone(),
 			},
 			validate: func(c client.Client, t *testing.T) {
@@ -631,7 +660,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 				testDNSZone(),
 			},
 			validate: func(c client.Client, t *testing.T) {
@@ -653,7 +681,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 				testAvailableDNSZone(),
 			},
 			validate: func(c client.Client, t *testing.T) {
@@ -671,7 +698,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 				func() *hivev1.DNSZone {
 					zone := testDNSZone()
 					zone.OwnerReferences = []metav1.OwnerReference{}
@@ -702,7 +728,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 				func() *hivev1.DNSZone {
 					zone := testDNSZone()
 					zone.OwnerReferences[0].UID = "other-uid"
@@ -734,7 +759,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 				testAvailableDNSZone(),
 			},
 			expectPendingCreation: true,
@@ -753,7 +777,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 				testAvailableDNSZone(),
 			},
 			validate: func(c client.Client, t *testing.T) {
@@ -772,7 +795,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 				testDNSZone(),
 			},
 			validate: func(c client.Client, t *testing.T) {
@@ -790,7 +812,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				deprovision := getDeprovision(c)
@@ -807,7 +828,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 				testFailedProvisionAttempt(0),
 				testFailedProvisionAttempt(1),
 				testFailedProvisionAttempt(2),
@@ -829,7 +849,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testClusterDeployment(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 				testProvision(),
 			},
 			validate: func(c client.Client, t *testing.T) {
@@ -847,7 +866,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testClusterDeployment(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 				testFailedProvisionAttempt(0),
 			},
 			expectPendingCreation: true,
@@ -870,7 +888,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testProvision(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			expectedRequeueAfter: 8*time.Hour + 60*time.Second,
 		},
@@ -888,7 +905,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			expectedRequeueAfter: 1 * time.Minute,
 			validate: func(c client.Client, t *testing.T) {
@@ -909,7 +925,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				cd := getCD(c)
@@ -932,7 +947,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			expectedRequeueAfter: defaultRequeueTime,
 			validate: func(c client.Client, t *testing.T) {
@@ -955,7 +969,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				cd := getCD(c)
@@ -976,7 +989,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(c client.Client, t *testing.T) {
 				cd := getCD(c)
@@ -1037,6 +1049,19 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				cd := getCD(c)
 				if assert.NotNil(t, cd, "missing clusterdeployment") {
 					assert.Equal(t, getClusterPlatform(cd), cd.Labels[hivev1.HiveClusterPlatformLabel], "incorrect cluster platform label")
+				}
+			},
+		},
+		{
+			name: "Add cluster region label",
+			existing: []runtime.Object{
+				testClusterDeploymentWithoutRegionLabel(),
+			},
+			validate: func(c client.Client, t *testing.T) {
+				cd := getCD(c)
+				if assert.NotNil(t, cd, "missing clusterdeployment") {
+					assert.Equal(t, getClusterRegion(cd), cd.Labels[hivev1.HiveClusterRegionLabel], "incorrect cluster region label")
+					assert.Equal(t, getClusterRegion(cd), "us-east-1", "incorrect cluster region label")
 				}
 			},
 		},
@@ -1103,7 +1128,6 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeDockerConfigJson, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			expectErr: true,
 			validate: func(c client.Client, t *testing.T) {
@@ -1375,6 +1399,7 @@ func testClusterDeployment() *hivev1.ClusterDeployment {
 	}
 
 	cd.Labels[hivev1.HiveClusterPlatformLabel] = "aws"
+	cd.Labels[hivev1.HiveClusterRegionLabel] = "us-east-1"
 
 	cd.Status = hivev1.ClusterDeploymentStatus{
 		InstallerImage: pointer.StringPtr("installer-image:latest"),
@@ -1402,6 +1427,12 @@ func testClusterDeploymentWithoutFinalizer() *hivev1.ClusterDeployment {
 func testClusterDeploymentWithoutPlatformLabel() *hivev1.ClusterDeployment {
 	cd := testClusterDeployment()
 	delete(cd.Labels, hivev1.HiveClusterPlatformLabel)
+	return cd
+}
+
+func testClusterDeploymentWithoutRegionLabel() *hivev1.ClusterDeployment {
+	cd := testClusterDeployment()
+	delete(cd.Labels, hivev1.HiveClusterRegionLabel)
 	return cd
 }
 
@@ -1612,7 +1643,6 @@ func TestUpdatePullSecretInfo(t *testing.T) {
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockercfg, pullSecretSecret, corev1.DockerConfigJsonKey, testPullSecret1),
 				testSecret(corev1.SecretTypeDockercfg, constants.GetMergedPullSecretName(testClusterDeployment()), corev1.DockerConfigJsonKey, "{}"),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(t *testing.T, pullSecretObj *corev1.Secret) {
 				pullSecret, ok := pullSecretObj.Data[corev1.DockerConfigJsonKey]
@@ -1632,7 +1662,6 @@ func TestUpdatePullSecretInfo(t *testing.T) {
 				}(),
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
 				testSecret(corev1.SecretTypeDockercfg, pullSecretSecret, corev1.DockerConfigJsonKey, testPullSecret1),
-				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
 			validate: func(t *testing.T, pullSecretObj *corev1.Secret) {
 				assert.Equal(t, testClusterDeployment().Name, pullSecretObj.Labels[constants.ClusterDeploymentNameLabel], "incorrect cluster deployment name label")

@@ -2,7 +2,8 @@
 // sources:
 // config/apiserver/apiservice.yaml
 // config/apiserver/deployment.yaml
-// config/apiserver/hiveapi-cluster-role-binding.yaml
+// config/apiserver/hiveapi_rbac_role.yaml
+// config/apiserver/hiveapi_rbac_role_binding.yaml
 // config/apiserver/service-account.yaml
 // config/apiserver/service.yaml
 // config/hiveadmission/apiservice.yaml
@@ -38,6 +39,7 @@
 // config/crds/hive_v1_dnszone.yaml
 // config/crds/hive_v1_hiveconfig.yaml
 // config/crds/hive_v1_machinepool.yaml
+// config/crds/hive_v1_machinepoolnamelease.yaml
 // config/crds/hive_v1_selectorsyncidentityprovider.yaml
 // config/crds/hive_v1_selectorsyncset.yaml
 // config/crds/hive_v1_syncidentityprovider.yaml
@@ -150,10 +152,10 @@ spec:
         resources:
           requests:
             cpu: 100m
-            memory: 100Mi
+            memory: 400Mi
           limits:
             cpu: 100m
-            memory: 200Mi
+            memory: 600Mi
         command:
           - "/opt/services/hive-apiserver"
         args:
@@ -189,62 +191,66 @@ func configApiserverDeploymentYaml() (*asset, error) {
 	return a, nil
 }
 
-var _configApiserverHiveapiClusterRoleBindingYaml = []byte(`---
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+var _configApiserverHiveapi_rbac_roleYaml = []byte(`apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
 metadata:
-  name: hiveapi-extension-apiserver-authentication-reader
-  namespace: hive
-roleRef:
-  name: extension-apiserver-authentication-reader
-  namespace: kube-system
-  kind: Role
-  apiGroup: rbac.authorization.k8s.io
-subjects:
-- kind: ServiceAccount
-  name: hiveapi-sa
-  namespace: hive
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: hiveapi-auth-delegator
-roleRef:
-  name: system:auth-delegator
-  kind: ClusterRole
-  apiGroup: rbac.authorization.k8s.io
-subjects:
-  - kind: ServiceAccount
-    name: hiveapi-sa
-    namespace: hive
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: hiveapi-manager
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: manager-role
-subjects:
-- kind: ServiceAccount
-  name: hiveapi-sa
-  namespace: hive
+  annotations:
+  name: system:openshift:hive:hiveapi
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+  - apiGroups: ["hive.openshift.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["*"]
 `)
 
-func configApiserverHiveapiClusterRoleBindingYamlBytes() ([]byte, error) {
-	return _configApiserverHiveapiClusterRoleBindingYaml, nil
+func configApiserverHiveapi_rbac_roleYamlBytes() ([]byte, error) {
+	return _configApiserverHiveapi_rbac_roleYaml, nil
 }
 
-func configApiserverHiveapiClusterRoleBindingYaml() (*asset, error) {
-	bytes, err := configApiserverHiveapiClusterRoleBindingYamlBytes()
+func configApiserverHiveapi_rbac_roleYaml() (*asset, error) {
+	bytes, err := configApiserverHiveapi_rbac_roleYamlBytes()
 	if err != nil {
 		return nil, err
 	}
 
-	info := bindataFileInfo{name: "config/apiserver/hiveapi-cluster-role-binding.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+	info := bindataFileInfo{name: "config/apiserver/hiveapi_rbac_role.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+	a := &asset{bytes: bytes, info: info}
+	return a, nil
+}
+
+var _configApiserverHiveapi_rbac_role_bindingYaml = []byte(`apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hiveapi-hive-hiveapi
+roleRef:
+  kind: ClusterRole
+  apiGroup: rbac.authorization.k8s.io
+  name: system:openshift:hive:hiveapi
+subjects:
+  - kind: ServiceAccount
+    namespace: hive
+    name: hiveapi-sa
+`)
+
+func configApiserverHiveapi_rbac_role_bindingYamlBytes() ([]byte, error) {
+	return _configApiserverHiveapi_rbac_role_bindingYaml, nil
+}
+
+func configApiserverHiveapi_rbac_role_bindingYaml() (*asset, error) {
+	bytes, err := configApiserverHiveapi_rbac_role_bindingYamlBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	info := bindataFileInfo{name: "config/apiserver/hiveapi_rbac_role_binding.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
 	a := &asset{bytes: bytes, info: info}
 	return a, nil
 }
@@ -646,52 +652,18 @@ func configHiveadmissionHiveadmission_rbac_roleYaml() (*asset, error) {
 	return a, nil
 }
 
-var _configHiveadmissionHiveadmission_rbac_role_bindingYaml = []byte(`apiVersion: v1
-kind: List
-items:
-# to delegate authentication and authorization
-- apiVersion: rbac.authorization.k8s.io/v1
-  kind: ClusterRoleBinding
-  metadata:
-    name: auth-delegator-hiveadmission
-  roleRef:
-    kind: ClusterRole
-    apiGroup: rbac.authorization.k8s.io
-    name: system:auth-delegator
-  subjects:
-  - kind: ServiceAccount
-    namespace: hive
-    name: hiveadmission
-
-
-# to let the admission server read the namespace reservations
-- apiVersion: rbac.authorization.k8s.io/v1
-  kind: ClusterRoleBinding
-  metadata:
-    name: hiveadmission-hive-hiveadmission
-  roleRef:
-    kind: ClusterRole
-    apiGroup: rbac.authorization.k8s.io
-    name: system:openshift:hive:hiveadmission
-  subjects:
-  - kind: ServiceAccount
-    namespace: hive
-    name: hiveadmission
-
-# to read the config for terminating authentication
-- apiVersion: rbac.authorization.k8s.io/v1
-  kind: RoleBinding
-  metadata:
-    namespace: kube-system
-    name: extension-server-authentication-reader-hiveadmission
-  roleRef:
-    kind: Role
-    apiGroup: rbac.authorization.k8s.io
-    name: extension-apiserver-authentication-reader
-  subjects:
-  - kind: ServiceAccount
-    namespace: hive
-    name: hiveadmission
+var _configHiveadmissionHiveadmission_rbac_role_bindingYaml = []byte(`apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: hiveadmission-hive-hiveadmission
+roleRef:
+  kind: ClusterRole
+  apiGroup: rbac.authorization.k8s.io
+  name: system:openshift:hive:hiveadmission
+subjects:
+- kind: ServiceAccount
+  namespace: hive
+  name: hiveadmission
 `)
 
 func configHiveadmissionHiveadmission_rbac_role_bindingYamlBytes() ([]byte, error) {
@@ -1017,11 +989,14 @@ rules:
   - clusterprovisions
   - dnszones
   - machinepools
+  - machinepoolnameleases
   - selectorsyncidentityproviders
   - syncidentityproviders
   - syncsets
   - syncsetinstances
   - clusterdeprovisions
+  # TODO: remove once v1alpha1 compat removed
+  - clusterdeprovisionrequests
   - clusterstates
   verbs:
   - get
@@ -1273,6 +1248,8 @@ rules:
   - machinepools
   - machinepools/status
   - machinepools/finalizers
+  - machinepoolnameleases
+  - machinepoolnameleases/status
   verbs:
   - get
   - list
@@ -1526,6 +1503,8 @@ rules:
   - selectorsyncsets
   - syncsets
   - clusterdeprovisions
+  # TODO: remove once v1alpha1 compat removed
+  - clusterdeprovisionrequests
   - clusterstates
   verbs:
   - get
@@ -1652,6 +1631,8 @@ rules:
   - syncsets
   - syncsetinstances
   - clusterdeprovisions
+  # TODO: remove once v1alpha1 compat removed
+  - clusterdeprovisionrequests
   - clusterstates
   verbs:
   - get
@@ -2882,6 +2863,10 @@ spec:
                   description: CredentialsSecretRef contains a reference to a secret
                     that contains AWS credentials for CRUD operations
                   type: object
+                region:
+                  description: Region is the AWS region to use for route53 operations.
+                    This defaults to us-east-1. For AWS China, use cn-northwest-1.
+                  type: string
               type: object
             gcp:
               description: GCP specifies GCP-specific cloud configuration
@@ -3053,6 +3038,10 @@ spec:
                       type: boolean
                   type: object
               type: object
+            deprovisionsDisabled:
+              description: DeprovisionsDisabled can be set to true to block deprovision
+                jobs from running.
+              type: boolean
             failedProvisionConfig:
               description: FailedProvisionConfig is used to configure settings related
                 to handling provision failures.
@@ -3076,6 +3065,10 @@ spec:
               description: HiveAPIEnabled is a boolean controlling whether or not
                 the Hive operator will start up the v1alpha1 aggregated API server.
               type: boolean
+            imageExtractionCLIImage:
+              description: ImageExtractionCLIImage can be set to override the location
+                of the image with the oc command line tool.
+              type: string
             logLevel:
               description: LogLevel is the level of logging to use for the Hive controllers.
                 Acceptable levels, from coarsest to finest, are panic, fatal, error,
@@ -3106,6 +3099,10 @@ spec:
                           parent ManageDNSConfig object. Secret should have AWS keys
                           named 'aws_access_key_id' and 'aws_secret_access_key'.
                         type: object
+                      region:
+                        description: Region is the AWS region to use for route53 operations.
+                          This defaults to us-east-1. For AWS China, use cn-northwest-1.
+                        type: string
                     type: object
                   domains:
                     description: Domains is the list of domains that hive will be
@@ -3140,6 +3137,15 @@ spec:
                 client CA configmap data from the openshift-config-managed namespace.
                 When the configmap changes, admission is redeployed.
               type: string
+            configApplied:
+              description: ConfigApplied will be set by the hive operator to indicate
+                whether or not the LastGenerationObserved was successfully reconciled.
+              type: boolean
+            observedGeneration:
+              description: ObservedGeneration will record the most recently processed
+                HiveConfig object's generation.
+              format: int64
+              type: integer
           type: object
   version: v1
 status:
@@ -3293,10 +3299,6 @@ spec:
                         type: string
                       type: array
                   type: object
-                bareMetal:
-                  description: BareMetal is the configuration used when installing
-                    on bare metal.
-                  type: object
                 gcp:
                   description: GCP is the configuration used when installing on GCP.
                   properties:
@@ -3409,6 +3411,72 @@ func configCrdsHive_v1_machinepoolYaml() (*asset, error) {
 	}
 
 	info := bindataFileInfo{name: "config/crds/hive_v1_machinepool.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
+	a := &asset{bytes: bytes, info: info}
+	return a, nil
+}
+
+var _configCrdsHive_v1_machinepoolnameleaseYaml = []byte(`apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  creationTimestamp: null
+  labels:
+    controller-tools.k8s.io: "1.0"
+  name: machinepoolnameleases.hive.openshift.io
+spec:
+  additionalPrinterColumns:
+  - JSONPath: .metadata.labels.hive\.openshift\.io/machine-pool-name
+    name: MachinePool
+    type: string
+  - JSONPath: .metadata.labels.hive\.openshift\.io/cluster-deployment-name
+    name: Cluster
+    type: string
+  - JSONPath: .metadata.creationTimestamp
+    name: Age
+    type: date
+  group: hive.openshift.io
+  names:
+    kind: MachinePoolNameLease
+    plural: machinepoolnameleases
+  scope: Namespaced
+  validation:
+    openAPIV3Schema:
+      properties:
+        apiVersion:
+          description: 'APIVersion defines the versioned schema of this representation
+            of an object. Servers should convert recognized schemas to the latest
+            internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#resources'
+          type: string
+        kind:
+          description: 'Kind is a string value representing the REST resource this
+            object represents. Servers may infer this from the endpoint the client
+            submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#types-kinds'
+          type: string
+        metadata:
+          type: object
+        spec:
+          type: object
+        status:
+          type: object
+  version: v1
+status:
+  acceptedNames:
+    kind: ""
+    plural: ""
+  conditions: []
+  storedVersions: []
+`)
+
+func configCrdsHive_v1_machinepoolnameleaseYamlBytes() ([]byte, error) {
+	return _configCrdsHive_v1_machinepoolnameleaseYaml, nil
+}
+
+func configCrdsHive_v1_machinepoolnameleaseYaml() (*asset, error) {
+	bytes, err := configCrdsHive_v1_machinepoolnameleaseYamlBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	info := bindataFileInfo{name: "config/crds/hive_v1_machinepoolnamelease.yaml", size: 0, mode: os.FileMode(0), modTime: time.Unix(0, 0)}
 	a := &asset{bytes: bytes, info: info}
 	return a, nil
 }
@@ -5160,6 +5228,20 @@ data:
       - "failed to initialize the cluster: Cluster operator monitoring is still updating"
       installFailingReason: MonitoringOperatorStillUpdating
       installFailingMessage: Timeout waiting for the monitoring operator to become ready
+    # Bare Metal
+    - name: LibvirtSSHKeyPermissionDenied
+      searchRegexStrings:
+      - "platform.baremetal.libvirtURI: Internal error: could not connect to libvirt: virError.Code=38, Domain=7, Message=.Cannot recv data: Permission denied"
+      installFailingReason: LibvirtSSHKeyPermissionDenied
+      installFailingMessage: "Permission denied connecting to libvirt host, check SSH key configuration and pass phrase"
+    # Processing stops at the first match, so this more generic
+    # message about the connection failure must always come after the
+    # more specific message for LibvirtSSHKeyPermissionDenied.
+    - name: LibvirtConnectionFailed
+      searchRegexStrings:
+      - "could not connect to libvirt"
+      installFailingReason: LibvirtConnectionFailed
+      installFailingMessage: "Could not connect to libvirt host"
 `)
 
 func configConfigmapsInstallLogRegexesConfigmapYamlBytes() ([]byte, error) {
@@ -5231,7 +5313,8 @@ func AssetNames() []string {
 var _bindata = map[string]func() (*asset, error){
 	"config/apiserver/apiservice.yaml":                          configApiserverApiserviceYaml,
 	"config/apiserver/deployment.yaml":                          configApiserverDeploymentYaml,
-	"config/apiserver/hiveapi-cluster-role-binding.yaml":        configApiserverHiveapiClusterRoleBindingYaml,
+	"config/apiserver/hiveapi_rbac_role.yaml":                   configApiserverHiveapi_rbac_roleYaml,
+	"config/apiserver/hiveapi_rbac_role_binding.yaml":           configApiserverHiveapi_rbac_role_bindingYaml,
 	"config/apiserver/service-account.yaml":                     configApiserverServiceAccountYaml,
 	"config/apiserver/service.yaml":                             configApiserverServiceYaml,
 	"config/hiveadmission/apiservice.yaml":                      configHiveadmissionApiserviceYaml,
@@ -5267,6 +5350,7 @@ var _bindata = map[string]func() (*asset, error){
 	"config/crds/hive_v1_dnszone.yaml":                          configCrdsHive_v1_dnszoneYaml,
 	"config/crds/hive_v1_hiveconfig.yaml":                       configCrdsHive_v1_hiveconfigYaml,
 	"config/crds/hive_v1_machinepool.yaml":                      configCrdsHive_v1_machinepoolYaml,
+	"config/crds/hive_v1_machinepoolnamelease.yaml":             configCrdsHive_v1_machinepoolnameleaseYaml,
 	"config/crds/hive_v1_selectorsyncidentityprovider.yaml":     configCrdsHive_v1_selectorsyncidentityproviderYaml,
 	"config/crds/hive_v1_selectorsyncset.yaml":                  configCrdsHive_v1_selectorsyncsetYaml,
 	"config/crds/hive_v1_syncidentityprovider.yaml":             configCrdsHive_v1_syncidentityproviderYaml,
@@ -5318,11 +5402,12 @@ type bintree struct {
 var _bintree = &bintree{nil, map[string]*bintree{
 	"config": {nil, map[string]*bintree{
 		"apiserver": {nil, map[string]*bintree{
-			"apiservice.yaml":                   {configApiserverApiserviceYaml, map[string]*bintree{}},
-			"deployment.yaml":                   {configApiserverDeploymentYaml, map[string]*bintree{}},
-			"hiveapi-cluster-role-binding.yaml": {configApiserverHiveapiClusterRoleBindingYaml, map[string]*bintree{}},
-			"service-account.yaml":              {configApiserverServiceAccountYaml, map[string]*bintree{}},
-			"service.yaml":                      {configApiserverServiceYaml, map[string]*bintree{}},
+			"apiservice.yaml":                {configApiserverApiserviceYaml, map[string]*bintree{}},
+			"deployment.yaml":                {configApiserverDeploymentYaml, map[string]*bintree{}},
+			"hiveapi_rbac_role.yaml":         {configApiserverHiveapi_rbac_roleYaml, map[string]*bintree{}},
+			"hiveapi_rbac_role_binding.yaml": {configApiserverHiveapi_rbac_role_bindingYaml, map[string]*bintree{}},
+			"service-account.yaml":           {configApiserverServiceAccountYaml, map[string]*bintree{}},
+			"service.yaml":                   {configApiserverServiceYaml, map[string]*bintree{}},
 		}},
 		"configmaps": {nil, map[string]*bintree{
 			"install-log-regexes-configmap.yaml": {configConfigmapsInstallLogRegexesConfigmapYaml, map[string]*bintree{}},
@@ -5337,6 +5422,7 @@ var _bintree = &bintree{nil, map[string]*bintree{
 			"hive_v1_dnszone.yaml":                      {configCrdsHive_v1_dnszoneYaml, map[string]*bintree{}},
 			"hive_v1_hiveconfig.yaml":                   {configCrdsHive_v1_hiveconfigYaml, map[string]*bintree{}},
 			"hive_v1_machinepool.yaml":                  {configCrdsHive_v1_machinepoolYaml, map[string]*bintree{}},
+			"hive_v1_machinepoolnamelease.yaml":         {configCrdsHive_v1_machinepoolnameleaseYaml, map[string]*bintree{}},
 			"hive_v1_selectorsyncidentityprovider.yaml": {configCrdsHive_v1_selectorsyncidentityproviderYaml, map[string]*bintree{}},
 			"hive_v1_selectorsyncset.yaml":              {configCrdsHive_v1_selectorsyncsetYaml, map[string]*bintree{}},
 			"hive_v1_syncidentityprovider.yaml":         {configCrdsHive_v1_syncidentityproviderYaml, map[string]*bintree{}},

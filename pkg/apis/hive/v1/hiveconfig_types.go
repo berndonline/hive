@@ -54,6 +54,13 @@ type HiveConfigSpec struct {
 	// nothing is running that will add or act upon finalizers on Hive types. This should rarely be needed.
 	// Sets replicas to 0 for the hive-controllers deployment to accomplish this.
 	MaintenanceMode *bool `json:"maintenanceMode,omitempty"`
+
+	// DeprovisionsDisabled can be set to true to block deprovision jobs from running.
+	DeprovisionsDisabled *bool `json:"deprovisionsDisabled,omitempty"`
+
+	// ImageExtractionCLIImage can be set to override the location of
+	// the image with the oc command line tool.
+	ImageExtractionCLIImage string `json:"imageExtractionCLIImage,omitempty"`
 }
 
 // HiveConfigStatus defines the observed state of Hive
@@ -62,6 +69,13 @@ type HiveConfigStatus struct {
 	// configmap data from the openshift-config-managed namespace. When the configmap changes,
 	// admission is redeployed.
 	AggregatorClientCAHash string `json:"aggregatorClientCAHash,omitempty"`
+
+	// ObservedGeneration will record the most recently processed HiveConfig object's generation.
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// ConfigApplied will be set by the hive operator to indicate whether or not the LastGenerationObserved
+	// was successfully reconciled.
+	ConfigApplied bool `json:"configApplied,omitempty"`
 }
 
 // BackupConfig contains settings for the Velero backup integration.
@@ -122,6 +136,12 @@ type ManageDNSAWSConfig struct {
 	// Secret should have AWS keys named 'aws_access_key_id' and 'aws_secret_access_key'.
 	// +optional
 	CredentialsSecretRef corev1.LocalObjectReference `json:"credentialsSecretRef,omitempty"`
+
+	// Region is the AWS region to use for route53 operations.
+	// This defaults to us-east-1.
+	// For AWS China, use cn-northwest-1.
+	// +optional
+	Region string `json:"region,omitempty"`
 }
 
 // ManageDNSGCPConfig contains GCP-specific info to manage a given domain.

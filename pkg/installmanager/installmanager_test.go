@@ -35,7 +35,6 @@ const (
 	testDeploymentName   = "test-deployment"
 	testProvisionName    = "test-provision"
 	testNamespace        = "test-namespace"
-	sshKeySecretName     = "ssh-key"
 	pullSecretSecretName = "pull-secret"
 
 	installerBinary     = "openshift-install"
@@ -156,10 +155,8 @@ func TestInstallManager(t *testing.T) {
 			defer os.RemoveAll(tempDir)
 			defer os.Remove(installerConsoleLogFilePath)
 
-			sshKeySecret := testSecret(corev1.SecretTypeOpaque, sshKeySecretName, adminSSHKeySecretKey, "fakesshkey")
 			pullSecret := testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecretName, corev1.DockerConfigJsonKey, "{}")
 			existing := test.existing
-			existing = append(existing, sshKeySecret)
 			existing = append(existing, pullSecret)
 
 			fakeClient := fake.NewFakeClient(existing...)
@@ -218,7 +215,7 @@ func TestInstallManager(t *testing.T) {
 			}
 
 			if test.failedInstallerLogRead {
-				im.readInstallerLog = func(*hivev1.ClusterProvision, *InstallManager) (string, error) {
+				im.readInstallerLog = func(*hivev1.ClusterProvision, *InstallManager, bool) (string, error) {
 					return "", fmt.Errorf("faiiled to save install log")
 				}
 			}
@@ -382,9 +379,10 @@ func testSecret(secretType corev1.SecretType, name, key, value string) *corev1.S
 
 func TestCleanupRegex(t *testing.T) {
 	tests := []struct {
-		name           string
-		sourceString   string
-		missingStrings []string
+		name            string
+		sourceString    string
+		missingStrings  []string
+		expectedStrings []string
 	}{
 		{
 			name: "install log example",
@@ -431,13 +429,32 @@ last line with password in text`,
 			sourceString:   `abc PaSsWoRd def`,
 			missingStrings: []string{"PaSsWoRd"},
 		},
+		{
+			name:         "libvirt ssh connection error in console log",
+			sourceString: "Internal error: could not connect to libvirt: virError(Code=38, Domain=7, Message='Cannot recv data: Permission denied, please try again.\\r\\nPermission denied (publickey,gssapi-keyex,gssapi-with-mic,password)",
+			missingStrings: []string{
+				"Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password)",
+			},
+			expectedStrings: []string{
+				"Internal error: could not connect to libvirt: virError(Code=38, Domain=7",
+				"Permission denied, please try again.",
+			},
+		},
 	}
 
 	for _, test := range tests {
 		cleanedString := cleanupLogOutput(test.sourceString)
 
 		for _, testString := range test.missingStrings {
-			assert.False(t, strings.Contains(cleanedString, testString), "testing %v: unexpected string found after cleaning", test.name)
+			assert.False(t, strings.Contains(cleanedString, testString),
+				"testing %v: unexpected string found after cleaning",
+				test.name, testString)
+		}
+
+		for _, testString := range test.expectedStrings {
+			assert.True(t, strings.Contains(cleanedString, testString),
+				"testing %v: expected string %q not found after cleaning: %q became %q",
+				test.name, testString, test.sourceString, cleanedString)
 		}
 	}
 

@@ -29,11 +29,14 @@ rules:
   - clusterprovisions
   - dnszones
   - machinepools
+  - machinepoolnameleases
   - selectorsyncidentityproviders
   - syncidentityproviders
   - syncsets
   - syncsetinstances
   - clusterdeprovisions
+  # TODO: remove once v1alpha1 compat removed
+  - clusterdeprovisionrequests
   - clusterstates
   verbs:
   - get

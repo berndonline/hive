@@ -1,18 +1,23 @@
 package v1migration
 
 import (
-	"io/ioutil"
+	"bufio"
+	"encoding/json"
+	"io"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
-	"sigs.k8s.io/yaml"
 
 	contributils "github.com/openshift/hive/contrib/pkg/utils"
 	hivev1alpha1 "github.com/openshift/hive/pkg/apis/hive/v1alpha1"
@@ -70,44 +75,71 @@ func (o *RestoreOwnerRefsOptions) Run() error {
 	if err != nil {
 		return errors.Wrap(err, "could not create kube client")
 	}
-	ownerRefsData, err := ioutil.ReadFile(filepath.Join(o.workDir, ownerRefsFilename))
+	file, err := os.Open(filepath.Join(o.workDir, ownerRefsFilename))
 	if err != nil {
-		return errors.Wrap(err, "could not read owner refs file")
+		return errors.Wrap(err, "could not open owner refs file")
 	}
-	var refs []ownerRef
-	if err := yaml.Unmarshal(ownerRefsData, &refs); err != nil {
-		return errors.Wrap(err, "could not unmarshal owner refs")
+	defer file.Close()
+	logger := log.StandardLogger()
+	ownerRefChan := make(chan ownerRef)
+	var processWG sync.WaitGroup
+	for i := 0; i < runtime.NumCPU(); i++ {
+		processWG.Add(1)
+		go processOwnerRefs(client, ownerRefChan, &processWG, logger)
 	}
-	for _, ref := range refs {
+	decoder := json.NewDecoder(bufio.NewReader(file))
+	for {
+		var ref ownerRef
+		if err := decoder.Decode(&ref); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return errors.Wrap(err, "could not decode JSON from file")
+		}
+		ownerRefChan <- ref
+	}
+	close(ownerRefChan)
+	processWG.Wait()
+	return nil
+}
+
+func processOwnerRefs(client dynamic.Interface, ownerRefChan chan ownerRef, wg *sync.WaitGroup, logger log.FieldLogger) {
+	defer wg.Done()
+	for ref := range ownerRefChan {
 		logger := log.WithField("resource", ref.Resource).WithField("name", ref.Name)
 		if ref.Namespace != "" {
 			logger = logger.WithField("namespace", ref.Namespace)
 		}
-		obj, err := ownerClient(client, ref).Get(ref.Name, metav1.GetOptions{})
+		obj, err := ownedClient(client, ref).Get(ref.Name, metav1.GetOptions{})
 		if err != nil {
+			if apierrors.IsNotFound(err) {
+				if isRefFromPVCToCD(ref) || isRefFromDNSEndpoint(ref) {
+					logger.Info("skipping reference of ClusterDeployment owning deleted PVC")
+					continue
+				}
+			}
 			logger.WithError(err).Error("could not get object to restore owner reference")
 			continue
 		}
 		logger = logger.WithField("referencedKind", ref.Ref.Kind).WithField("referencedName", ref.Ref.Name)
-		referencedObj, err := ownedClient(client, ref).Get(ref.Ref.Name, metav1.GetOptions{})
+		ownerObj, err := ownerClient(client, ref).Get(ref.Ref.Name, metav1.GetOptions{})
 		if err != nil {
-			logger.WithError(err).Error("could not get referenced object")
+			logger.WithError(err).Error("could not get owner object")
 			continue
 		}
-		if ownerRefs, changed := restoreOwnerReference(obj.GetOwnerReferences(), ref, referencedObj); changed {
+		if ownerRefs, changed := restoreOwnerReference(obj.GetOwnerReferences(), ref, ownerObj); changed {
 			logger.Info("restoring owner reference")
 			obj.SetOwnerReferences(ownerRefs)
-			if _, err := ownerClient(client, ref).Update(obj, metav1.UpdateOptions{}); err != nil {
+			if _, err := ownedClient(client, ref).Update(obj, metav1.UpdateOptions{}); err != nil {
 				logger.WithError(err).Error("could not update object")
 			}
 		} else {
 			logger.Info("owner reference already restored")
 		}
 	}
-	return nil
 }
 
-func ownerClient(client dynamic.Interface, ref ownerRef) dynamic.ResourceInterface {
+func ownedClient(client dynamic.Interface, ref ownerRef) dynamic.ResourceInterface {
 	gvr := schema.GroupVersionResource{
 		Group:    ref.Group,
 		Version:  ref.Version,
@@ -119,7 +151,7 @@ func ownerClient(client dynamic.Interface, ref ownerRef) dynamic.ResourceInterfa
 	return client.Resource(gvr)
 }
 
-func ownedClient(client dynamic.Interface, ref ownerRef) dynamic.ResourceInterface {
+func ownerClient(client dynamic.Interface, ref ownerRef) dynamic.ResourceInterface {
 	gvr := hivev1alpha1.SchemeGroupVersion.WithResource(resourceForHiveKind(ref.Ref.Kind))
 	if isNamespaceScoped(ref.Ref.Kind) {
 		return client.Resource(gvr).Namespace(ref.Namespace)
@@ -127,8 +159,8 @@ func ownedClient(client dynamic.Interface, ref ownerRef) dynamic.ResourceInterfa
 	return client.Resource(gvr)
 }
 
-func restoreOwnerReference(ownerRefs []metav1.OwnerReference, ref ownerRef, referencedObj *unstructured.Unstructured) (newOwnerRefs []metav1.OwnerReference, changed bool) {
-	newUID := referencedObj.GetUID()
+func restoreOwnerReference(ownerRefs []metav1.OwnerReference, ref ownerRef, ownerObj *unstructured.Unstructured) (newOwnerRefs []metav1.OwnerReference, changed bool) {
+	newUID := ownerObj.GetUID()
 	for i, ownerRef := range ownerRefs {
 		if ownerRef.APIVersion != ref.Ref.APIVersion ||
 			ownerRef.Kind != ref.Ref.Kind ||
@@ -163,4 +195,13 @@ func isNamespaceScoped(kind string) bool {
 	default:
 		return true
 	}
+}
+
+func isRefFromPVCToCD(ref ownerRef) bool {
+	return ref.Resource == "persistentvolumeclaims" && ref.Group == "" &&
+		ref.Ref.Kind == "ClusterDeployment" && ref.Ref.APIVersion == hivev1alpha1.SchemeGroupVersion.String()
+}
+
+func isRefFromDNSEndpoint(ref ownerRef) bool {
+	return ref.Resource == "dnsendpoints" && ref.Group == hivev1alpha1.GroupName
 }

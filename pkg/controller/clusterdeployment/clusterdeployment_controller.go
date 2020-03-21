@@ -6,6 +6,7 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -51,8 +52,6 @@ const (
 	defaultRequeueTime = 10 * time.Second
 	maxProvisions      = 3
 
-	adminSSHKeySecretKey  = "ssh-publickey"
-	adminKubeconfigKey    = "kubeconfig"
 	rawAdminKubeconfigKey = "raw-kubeconfig"
 
 	clusterImageSetNotFoundReason = "ClusterImageSetNotFound"
@@ -64,6 +63,13 @@ const (
 
 	deleteAfterAnnotation    = "hive.openshift.io/delete-after" // contains a duration after which the cluster should be cleaned up.
 	tryInstallOnceAnnotation = "hive.openshift.io/try-install-once"
+
+	platformAWS       = "aws"
+	platformAzure     = "azure"
+	platformGCP       = "gcp"
+	platformBaremetal = "baremetal"
+	platformUnknown   = "unknown"
+	regionUnknown     = "unknown"
 )
 
 var (
@@ -286,7 +292,7 @@ func (r *ReconcileClusterDeployment) Reconcile(request reconcile.Request) (resul
 	return r.reconcile(request, cd, cdLog)
 }
 
-func (r *ReconcileClusterDeployment) postProcessAdminKubeconfig(cd *hivev1.ClusterDeployment,
+func (r *ReconcileClusterDeployment) addAdditionalKubeconfigCAs(cd *hivev1.ClusterDeployment,
 	cdLog log.FieldLogger) error {
 
 	adminKubeconfigSecret := &corev1.Secret{}
@@ -294,14 +300,34 @@ func (r *ReconcileClusterDeployment) postProcessAdminKubeconfig(cd *hivev1.Clust
 		cdLog.WithError(err).Error("failed to get admin kubeconfig secret")
 		return err
 	}
-	if err := r.fixupAdminKubeconfigSecret(adminKubeconfigSecret, cdLog); err != nil {
-		cdLog.WithError(err).Error("failed to fix up admin kubeconfig secret")
+
+	originalSecret := adminKubeconfigSecret.DeepCopy()
+
+	rawData, hasRawData := adminKubeconfigSecret.Data[rawAdminKubeconfigKey]
+	if !hasRawData {
+		adminKubeconfigSecret.Data[rawAdminKubeconfigKey] = adminKubeconfigSecret.Data[constants.KubeconfigSecretKey]
+		rawData = adminKubeconfigSecret.Data[constants.KubeconfigSecretKey]
+	}
+
+	var err error
+	adminKubeconfigSecret.Data[constants.KubeconfigSecretKey], err = controllerutils.AddAdditionalKubeconfigCAs(rawData)
+	if err != nil {
+		cdLog.WithError(err).Errorf("error adding additional CAs to admin kubeconfig")
 		return err
 	}
-	if err := r.setAdminKubeconfigStatus(cd, cdLog); err != nil {
-		cdLog.WithError(err).Error("failed to set admin kubeconfig status")
+
+	if reflect.DeepEqual(originalSecret.Data, adminKubeconfigSecret.Data) {
+		cdLog.Debug("secret data has not changed, no need to update")
+		return nil
+	}
+
+	cdLog.Info("admin kubeconfig has been modified, updating")
+	err = r.Update(context.TODO(), adminKubeconfigSecret)
+	if err != nil {
+		cdLog.WithError(err).Log(controllerutils.LogLevel(err), "error updating admin kubeconfig secret")
 		return err
 	}
+
 	return nil
 }
 
@@ -319,6 +345,23 @@ func (r *ReconcileClusterDeployment) reconcile(request reconcile.Request, cd *hi
 		err := r.Update(context.TODO(), cd)
 		if err != nil {
 			cdLog.WithError(err).Log(controllerutils.LogLevel(err), "failed to set cluster platform label")
+		}
+		return reconcile.Result{}, err
+	}
+
+	// Set region label on the ClusterDeployment
+	if region := getClusterRegion(cd); cd.Spec.Platform.BareMetal == nil && cd.Labels[hivev1.HiveClusterRegionLabel] != region {
+		if cd.Labels == nil {
+			cd.Labels = make(map[string]string)
+		}
+		if cd.Labels[hivev1.HiveClusterRegionLabel] != "" {
+			cdLog.Warnf("changing the value of %s from %s to %s", hivev1.HiveClusterRegionLabel,
+				cd.Labels[hivev1.HiveClusterRegionLabel], region)
+		}
+		cd.Labels[hivev1.HiveClusterRegionLabel] = region
+		err := r.Update(context.TODO(), cd)
+		if err != nil {
+			cdLog.WithError(err).Log(controllerutils.LogLevel(err), "failed to set cluster region label")
 		}
 		return reconcile.Result{}, err
 	}
@@ -409,16 +452,21 @@ func (r *ReconcileClusterDeployment) reconcile(request reconcile.Request, cd *hi
 		r.cleanupInstallLogPVC(cd, cdLog)
 
 		if cd.Spec.ClusterMetadata != nil &&
-			cd.Spec.ClusterMetadata.AdminKubeconfigSecretRef.Name != "" &&
-			(cd.Status.WebConsoleURL == "" || cd.Status.APIURL == "") {
+			cd.Spec.ClusterMetadata.AdminKubeconfigSecretRef.Name != "" {
 
-			err := r.postProcessAdminKubeconfig(cd, cdLog)
-			if err != nil {
+			if err := r.addAdditionalKubeconfigCAs(cd, cdLog); err != nil {
 				return reconcile.Result{}, err
 			}
-			if err := r.Status().Update(context.TODO(), cd); err != nil {
-				cdLog.WithError(err).Log(controllerutils.LogLevel(err), "could not set installed status")
-				return reconcile.Result{}, err
+
+			if cd.Status.WebConsoleURL == "" || cd.Status.APIURL == "" {
+				if err := r.setClusterStatusURLs(cd, cdLog); err != nil {
+					cdLog.WithError(err).Error("failed to set admin kubeconfig status")
+					return reconcile.Result{}, err
+				}
+				if err := r.Status().Update(context.TODO(), cd); err != nil {
+					cdLog.WithError(err).Log(controllerutils.LogLevel(err), "could not set installed status")
+					return reconcile.Result{}, err
+				}
 			}
 
 		}
@@ -708,18 +756,24 @@ func (r *ReconcileClusterDeployment) reconcileCompletedProvision(cd *hivev1.Clus
 		cd.Status.Conditions = conds
 	}
 	if cd.Spec.ClusterMetadata != nil &&
-		cd.Spec.ClusterMetadata.AdminKubeconfigSecretRef.Name != "" &&
-		(cd.Status.WebConsoleURL == "" || cd.Status.APIURL == "") {
+		cd.Spec.ClusterMetadata.AdminKubeconfigSecretRef.Name != "" {
 
-		statusChange = true
-		err := r.postProcessAdminKubeconfig(cd, cdLog)
-		if err != nil {
+		if err := r.addAdditionalKubeconfigCAs(cd, cdLog); err != nil {
 			return reconcile.Result{}, err
 		}
+
+		if cd.Status.WebConsoleURL == "" || cd.Status.APIURL == "" {
+			statusChange = true
+			if err := r.setClusterStatusURLs(cd, cdLog); err != nil {
+				cdLog.WithError(err).Error("failed to set cluster status URLs")
+				return reconcile.Result{}, err
+			}
+		}
+
 	}
 	if statusChange {
 		if err := r.Status().Update(context.TODO(), cd); err != nil {
-			cdLog.WithError(err).Log(controllerutils.LogLevel(err), "could not set installed status")
+			cdLog.WithError(err).Log(controllerutils.LogLevel(err), "failed to update cluster deployment status")
 			return reconcile.Result{}, err
 		}
 	}
@@ -1013,42 +1067,10 @@ func (r *ReconcileClusterDeployment) setImageSetNotFoundCondition(cd *hivev1.Clu
 	return err
 }
 
-func (r *ReconcileClusterDeployment) fixupAdminKubeconfigSecret(secret *corev1.Secret, cdLog log.FieldLogger) error {
-	originalSecret := secret.DeepCopy()
-
-	rawData, hasRawData := secret.Data[rawAdminKubeconfigKey]
-	if !hasRawData {
-		secret.Data[rawAdminKubeconfigKey] = secret.Data[adminKubeconfigKey]
-		rawData = secret.Data[adminKubeconfigKey]
-	}
-
-	var err error
-	secret.Data[adminKubeconfigKey], err = controllerutils.FixupKubeconfig(rawData)
-	if err != nil {
-		cdLog.WithError(err).Errorf("cannot fixup kubeconfig to generate new one")
-		return err
-	}
-
-	if reflect.DeepEqual(originalSecret.Data, secret.Data) {
-		cdLog.Debug("secret data has not changed, no need to update")
-		return nil
-	}
-
-	err = r.Update(context.TODO(), secret)
-	if err != nil {
-		cdLog.WithError(err).Log(controllerutils.LogLevel(err), "error updated admin kubeconfig secret")
-		return err
-	}
-
-	return nil
-}
-
-// setAdminKubeconfigStatus sets all cluster status fields that depend on the admin kubeconfig.
-func (r *ReconcileClusterDeployment) setAdminKubeconfigStatus(cd *hivev1.ClusterDeployment, cdLog log.FieldLogger) error {
-	if cd.Status.WebConsoleURL != "" || cd.Status.APIURL != "" {
-		return nil
-	}
-
+// setClusterStatusURLs fetches the openshift console route from the remote cluster and uses it to determine
+// the correct APIURL and WebConsoleURL, and then set them in the Status. Typically only called if these Status fields
+// are unset.
+func (r *ReconcileClusterDeployment) setClusterStatusURLs(cd *hivev1.ClusterDeployment, cdLog log.FieldLogger) error {
 	remoteClientBuilder := r.remoteClusterAPIClientBuilder(cd)
 	server, err := remoteClientBuilder.APIURL()
 	if err != nil {
@@ -1360,9 +1382,14 @@ func (r *ReconcileClusterDeployment) createManagedDNSZone(cd *hivev1.ClusterDepl
 		for k, v := range cd.Spec.Platform.AWS.UserTags {
 			additionalTags = append(additionalTags, hivev1.AWSResourceTag{Key: k, Value: v})
 		}
+		region := ""
+		if strings.HasPrefix(cd.Spec.Platform.AWS.Region, constants.AWSChinaRegionPrefix) {
+			region = constants.AWSChinaRoute53Region
+		}
 		dnsZone.Spec.AWS = &hivev1.AWSDNSZoneSpec{
 			CredentialsSecretRef: cd.Spec.Platform.AWS.CredentialsSecretRef,
 			AdditionalTags:       additionalTags,
+			Region:               region,
 		}
 	case cd.Spec.Platform.GCP != nil:
 		dnsZone.Spec.GCP = &hivev1.GCPDNSZoneSpec{
@@ -1815,13 +1842,26 @@ func (r *ReconcileClusterDeployment) setSyncSetFailedCondition(cd *hivev1.Cluste
 func getClusterPlatform(cd *hivev1.ClusterDeployment) string {
 	switch {
 	case cd.Spec.Platform.AWS != nil:
-		return "aws"
+		return platformAWS
 	case cd.Spec.Platform.Azure != nil:
-		return "azure"
+		return platformAzure
 	case cd.Spec.Platform.GCP != nil:
-		return "gcp"
+		return platformGCP
 	case cd.Spec.Platform.BareMetal != nil:
-		return "baremetal"
+		return platformBaremetal
 	}
-	return "unknown"
+	return platformUnknown
+}
+
+// getClusterRegion returns the region of a given ClusterDeployment
+func getClusterRegion(cd *hivev1.ClusterDeployment) string {
+	switch {
+	case cd.Spec.Platform.AWS != nil:
+		return cd.Spec.Platform.AWS.Region
+	case cd.Spec.Platform.Azure != nil:
+		return cd.Spec.Platform.Azure.Region
+	case cd.Spec.Platform.GCP != nil:
+		return cd.Spec.Platform.GCP.Region
+	}
+	return regionUnknown
 }
