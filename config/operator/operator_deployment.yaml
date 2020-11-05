@@ -3,13 +3,11 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: hive-operator
-  namespace: hive
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: hive-operator
-  namespace: hive
   labels:
     control-plane: hive-operator
     controller-tools.k8s.io: "1.0"
@@ -20,6 +18,8 @@ spec:
       controller-tools.k8s.io: "1.0"
   replicas: 1
   revisionHistoryLimit: 4
+  strategy:
+    type: Recreate
   template:
     metadata:
       labels:
@@ -49,11 +49,16 @@ spec:
         env:
         - name: CLI_CACHE_DIR
           value: /var/cache/kubectl
+        - name: HIVE_OPERATOR_NS
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
         livenessProbe:
           httpGet:
-            path: /debug/health
+            path: /healthz
             port: 8080
-          initialDelaySeconds: 10
-          failureThreshold: 1
-          periodSeconds: 10
       terminationGracePeriodSeconds: 10

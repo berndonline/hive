@@ -32,7 +32,7 @@ func TestNewGCPActuator(t *testing.T) {
 			// Arrange
 			mocks := setupDefaultMocks(t)
 			expectedGCPActuator := &GCPActuator{
-				logger:  log.WithField("controller", controllerName),
+				logger:  log.WithField("controller", ControllerName),
 				dnsZone: tc.dnsZone,
 			}
 
@@ -76,5 +76,6 @@ func mockCreateGCPZone(expect *mock.MockClientMockRecorder) {
 }
 
 func mockDeleteGCPZone(expect *mock.MockClientMockRecorder) {
+	expect.ListResourceRecordSets(gomock.Any(), gomock.Any()).Return(&dns.ResourceRecordSetsListResponse{}, nil)
 	expect.DeleteManagedZone(gomock.Any()).Return(nil).Times(1)
 }

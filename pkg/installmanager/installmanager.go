@@ -16,18 +16,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/openshift/hive/pkg/gcpclient"
-
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"sigs.k8s.io/yaml"
-
-	contributils "github.com/openshift/hive/contrib/pkg/utils"
-	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
-	"github.com/openshift/hive/pkg/constants"
-	controllerutils "github.com/openshift/hive/pkg/controller/utils"
-	"github.com/openshift/hive/pkg/resource"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -38,25 +30,35 @@ import (
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	clientwatch "k8s.io/client-go/tools/watch"
-	k8slabels "k8s.io/kubernetes/pkg/util/labels"
-	"k8s.io/utils/pointer"
-
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/util/retry"
-
+	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
-	azuresession "github.com/openshift/installer/pkg/asset/installconfig/azure"
 	"github.com/openshift/installer/pkg/destroy/aws"
 	"github.com/openshift/installer/pkg/destroy/azure"
 	"github.com/openshift/installer/pkg/destroy/gcp"
+	"github.com/openshift/installer/pkg/destroy/openstack"
+	"github.com/openshift/installer/pkg/destroy/ovirt"
+	"github.com/openshift/installer/pkg/destroy/providers"
+	"github.com/openshift/installer/pkg/destroy/vsphere"
 	installertypes "github.com/openshift/installer/pkg/types"
+	installertypesazure "github.com/openshift/installer/pkg/types/azure"
 	installertypesgcp "github.com/openshift/installer/pkg/types/gcp"
+	installertypesopenstack "github.com/openshift/installer/pkg/types/openstack"
+	installertypesovirt "github.com/openshift/installer/pkg/types/ovirt"
+	installertypesvsphere "github.com/openshift/installer/pkg/types/vsphere"
+
+	contributils "github.com/openshift/hive/contrib/pkg/utils"
+	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
+	"github.com/openshift/hive/pkg/constants"
+	"github.com/openshift/hive/pkg/gcpclient"
+	"github.com/openshift/hive/pkg/resource"
+	k8slabels "github.com/openshift/hive/pkg/util/labels"
 )
 
 const (
@@ -87,26 +89,28 @@ var (
 // InstallManager coordinates executing the openshift-install binary, modifying
 // generated assets, and uploading artifacts to the kube API after completion.
 type InstallManager struct {
-	log                      log.FieldLogger
-	LogLevel                 string
-	WorkDir                  string
-	LogsDir                  string
-	ClusterID                string
-	ClusterName              string
-	ClusterProvisionName     string
-	Namespace                string
-	InstallConfigMountPath   string
-	PullSecretMountPath      string
-	ManifestsMountPath       string
-	DynamicClient            client.Client
-	cleanupFailedProvision   func(dynamicClient client.Client, cd *hivev1.ClusterDeployment, infraID string, logger log.FieldLogger) error
-	updateClusterProvision   func(*hivev1.ClusterProvision, *InstallManager, provisionMutation) error
-	readClusterMetadata      func(*hivev1.ClusterProvision, *InstallManager) ([]byte, *installertypes.ClusterMetadata, error)
-	uploadAdminKubeconfig    func(*hivev1.ClusterProvision, *InstallManager) (*corev1.Secret, error)
-	uploadAdminPassword      func(*hivev1.ClusterProvision, *InstallManager) (*corev1.Secret, error)
-	readInstallerLog         func(*hivev1.ClusterProvision, *InstallManager, bool) (string, error)
-	waitForProvisioningStage func(*hivev1.ClusterProvision, *InstallManager) error
-	isGatherLogsEnabled      func() bool
+	log                              log.FieldLogger
+	LogLevel                         string
+	WorkDir                          string
+	LogsDir                          string
+	ClusterID                        string
+	ClusterName                      string
+	ClusterProvisionName             string
+	Namespace                        string
+	InstallConfigMountPath           string
+	PullSecretMountPath              string
+	ManifestsMountPath               string
+	DynamicClient                    client.Client
+	cleanupFailedProvision           func(dynamicClient client.Client, cd *hivev1.ClusterDeployment, infraID string, logger log.FieldLogger) error
+	updateClusterProvision           func(*hivev1.ClusterProvision, *InstallManager, provisionMutation) error
+	readClusterMetadata              func(*hivev1.ClusterProvision, *InstallManager) ([]byte, *installertypes.ClusterMetadata, error)
+	uploadAdminKubeconfig            func(*hivev1.ClusterProvision, *InstallManager) (*corev1.Secret, error)
+	uploadAdminPassword              func(*hivev1.ClusterProvision, *InstallManager) (*corev1.Secret, error)
+	readInstallerLog                 func(*hivev1.ClusterProvision, *InstallManager, bool) (string, error)
+	waitForProvisioningStage         func(*hivev1.ClusterProvision, *InstallManager) error
+	isGatherLogsEnabled              func() bool
+	waitForInstallCompleteExecutions int
+	binaryDir                        string
 }
 
 // NewInstallManagerCommand is the entrypoint to create the 'install-manager' subcommand
@@ -124,13 +128,14 @@ func NewInstallManagerCommand() *cobra.Command {
 
 			if len(args) != 2 {
 				cmd.Help()
-				im.log.Fatal("invalid command arguments")
+				im.log.WithField("args", args).Fatal("invalid command arguments")
 			}
 			// Parse the namespace/name for our cluster provision:
 			im.Namespace, im.ClusterProvisionName = args[0], args[1]
 			im.InstallConfigMountPath = defaultInstallConfigMountPath
 			im.PullSecretMountPath = defaultPullSecretMountPath
 			im.ManifestsMountPath = defaultManifestsMountPath
+			im.binaryDir = getHomeDir()
 
 			if err := im.Validate(); err != nil {
 				log.WithError(err).Error("invalid command options")
@@ -274,7 +279,10 @@ func (m *InstallManager) Run() error {
 
 	m.ClusterName = cd.Spec.ClusterName
 
-	m.waitForInstallerBinaries()
+	if err := m.waitForAndCopyInstallerBinaries(); err != nil {
+		m.log.WithError(err).Error("error waiting for/copying binaries")
+		return err
+	}
 
 	go m.tailFullInstallLog(scrubInstallLog)
 
@@ -381,6 +389,15 @@ func (m *InstallManager) Run() error {
 	}
 
 	m.log.Info("provisioning cluster")
+
+	if waitForInstallCompleteExecutions, ok := cd.Annotations[constants.WaitForInstallCompleteExecutionsAnnotation]; ok {
+		m.waitForInstallCompleteExecutions, err = strconv.Atoi(waitForInstallCompleteExecutions)
+		if err != nil {
+			m.log.WithField("value", waitForInstallCompleteExecutions).WithError(err).
+				Errorf("error parsing integer from %s annotation", constants.WaitForInstallCompleteExecutionsAnnotation)
+		}
+	}
+
 	installErr := m.provisionCluster()
 	if installErr != nil {
 		m.log.WithError(installErr).Error("error running openshift-install, running deprovision to clean up")
@@ -454,12 +471,33 @@ func (m *InstallManager) waitForFiles(files []string) {
 	m.log.Infof("all files found, ready to proceed")
 }
 
-func (m *InstallManager) waitForInstallerBinaries() {
+func (m *InstallManager) waitForAndCopyInstallerBinaries() error {
 	fileList := []string{
 		filepath.Join(m.WorkDir, "openshift-install"),
 		filepath.Join(m.WorkDir, "oc"),
 	}
 	m.waitForFiles(fileList)
+
+	// copy each binary to our container user's home dir to avoid situations
+	// where the /output workdir may be mounted with noexec. (surfaced when using kind
+	// 0.8.x with podman but will likely be fixed in future versions)
+	for _, src := range fileList {
+		dest := filepath.Join(m.binaryDir, filepath.Base(src))
+		if err := m.copyFile(src, dest); err != nil {
+			return err
+		}
+		m.log.Infof("copied %s to %s", src, dest)
+	}
+	return nil
+}
+
+func (m *InstallManager) copyFile(src, dst string) error {
+	cmd := exec.Command("cp", "-p", src, dst)
+	if err := cmd.Run(); err != nil {
+		log.WithError(err).Errorf("error copying file %s to %s", src, dst)
+		return err
+	}
+	return nil
 }
 
 // cleanupFailedInstall allows recovering from an installation error and allows retries
@@ -489,58 +527,32 @@ func (m *InstallManager) cleanupFailedInstall(cd *hivev1.ClusterDeployment, prov
 }
 
 func cleanupFailedProvision(dynClient client.Client, cd *hivev1.ClusterDeployment, infraID string, logger log.FieldLogger) error {
+	var uninstaller providers.Destroyer
 	switch {
 	case cd.Spec.Platform.AWS != nil:
 		// run the uninstaller to clean up any cloud resources previously created
 		filters := []aws.Filter{
 			{kubernetesKeyPrefix + infraID: "owned"},
 		}
-		uninstaller := &aws.ClusterUninstaller{
+		uninstaller = &aws.ClusterUninstaller{
 			Filters: filters,
 			Region:  cd.Spec.Platform.AWS.Region,
 			Logger:  logger,
 		}
-
-		if err := uninstaller.Run(); err != nil {
-			return err
-		}
-
-		// If we're managing DNS for this cluster, lookup the DNSZone and cleanup
-		// any leftover A records that may have leaked due to
-		// https://jira.coreos.com/browse/CORS-1195.
-		if cd.Spec.ManageDNS {
-			dnsZone := &hivev1.DNSZone{}
-			dnsZoneNamespacedName := types.NamespacedName{Namespace: cd.Namespace, Name: controllerutils.DNSZoneName(cd.Name)}
-			err := dynClient.Get(context.TODO(), dnsZoneNamespacedName, dnsZone)
-			if err != nil {
-				logger.WithError(err).Error("error looking up managed dnszone")
-				return err
-			}
-			if dnsZone.Status.AWS == nil {
-				return fmt.Errorf("found non-AWS DNSZone for AWS ClusterDeployment")
-			}
-			if dnsZone.Status.AWS.ZoneID == nil {
-				// Shouldn't really be possible as we block install until DNS is ready:
-				return fmt.Errorf("DNSZone %s has no ZoneID set", dnsZone.Name)
-			}
-			return cleanupDNSZone(*dnsZone.Status.AWS.ZoneID, cd.Spec.Platform.AWS.Region, logger)
-		}
-		return nil
 	case cd.Spec.Platform.Azure != nil:
-		uninstaller := &azure.ClusterUninstaller{}
-		uninstaller.Logger = logger
-		session, err := azuresession.GetSession()
+		metadata := &installertypes.ClusterMetadata{
+			InfraID: infraID,
+			ClusterPlatformMetadata: installertypes.ClusterPlatformMetadata{
+				Azure: &installertypesazure.Metadata{
+					CloudName: installertypesazure.PublicCloud,
+				},
+			},
+		}
+		var err error
+		uninstaller, err = azure.New(logger, metadata)
 		if err != nil {
 			return err
 		}
-
-		uninstaller.InfraID = infraID
-		uninstaller.SubscriptionID = session.Credentials.SubscriptionID
-		uninstaller.TenantID = session.Credentials.TenantID
-		uninstaller.GraphAuthorizer = session.GraphAuthorizer
-		uninstaller.Authorizer = session.Authorizer
-
-		return uninstaller.Run()
 	case cd.Spec.Platform.GCP != nil:
 		credsFile := os.Getenv("GOOGLE_CREDENTIALS")
 		projectID, err := gcpclient.ProjectIDFromFile(credsFile)
@@ -556,15 +568,75 @@ func cleanupFailedProvision(dynClient client.Client, cd *hivev1.ClusterDeploymen
 				},
 			},
 		}
-		uninstaller, err := gcp.New(logger, metadata)
+		uninstaller, err = gcp.New(logger, metadata)
 		if err != nil {
 			return err
 		}
-		return uninstaller.Run()
+	case cd.Spec.Platform.OpenStack != nil:
+		metadata := &installertypes.ClusterMetadata{
+			InfraID: infraID,
+			ClusterPlatformMetadata: installertypes.ClusterPlatformMetadata{
+				OpenStack: &installertypesopenstack.Metadata{
+					Cloud: cd.Spec.Platform.OpenStack.Cloud,
+					Identifier: map[string]string{
+						"openshiftClusterID": infraID,
+					},
+				},
+			},
+		}
+		var err error
+		uninstaller, err = openstack.New(logger, metadata)
+		if err != nil {
+			return err
+		}
+	case cd.Spec.Platform.VSphere != nil:
+		vSphereUsername := os.Getenv(constants.VSphereUsernameEnvVar)
+		if vSphereUsername == "" {
+			return fmt.Errorf("No %s env var set, cannot proceed", constants.VSphereUsernameEnvVar)
+		}
+		vSpherePassword := os.Getenv(constants.VSpherePasswordEnvVar)
+		if vSpherePassword == "" {
+			return fmt.Errorf("No %s env var set, cannot proceed", constants.VSpherePasswordEnvVar)
+		}
+		metadata := &installertypes.ClusterMetadata{
+			InfraID: infraID,
+			ClusterPlatformMetadata: installertypes.ClusterPlatformMetadata{
+				VSphere: &installertypesvsphere.Metadata{
+					VCenter:  cd.Spec.Platform.VSphere.VCenter,
+					Username: vSphereUsername,
+					Password: vSpherePassword,
+				},
+			},
+		}
+		var err error
+		uninstaller, err = vsphere.New(logger, metadata)
+		if err != nil {
+			return err
+		}
+	case cd.Spec.Platform.Ovirt != nil:
+		metadata := &installertypes.ClusterMetadata{
+			InfraID: infraID,
+			ClusterPlatformMetadata: installertypes.ClusterPlatformMetadata{
+				Ovirt: &installertypesovirt.Metadata{
+					ClusterID: cd.Spec.Platform.Ovirt.ClusterID,
+				},
+			},
+		}
+		var err error
+		uninstaller, err = ovirt.New(logger, metadata)
+		if err != nil {
+			return err
+		}
 	default:
 		logger.Warn("unknown platform for re-try cleanup")
 		return errors.New("unknown platform for re-try cleanup")
 	}
+
+	if err := uninstaller.Run(); err != nil {
+		return err
+	}
+
+	return cleanupDNSZone(dynClient, cd, logger)
 }
 
 // generateAssets runs openshift-install commands to generate on-disk assets we need to
@@ -606,9 +678,12 @@ func (m *InstallManager) provisionCluster() error {
 	m.log.Info("running openshift-install create cluster")
 
 	if err := m.runOpenShiftInstallCommand("create", "cluster"); err != nil {
-		if m.isBootstrapComplete() {
-			m.log.WithError(err).Warn("provisioning cluster failed after completing bootstrapping, waiting longer for install to complete")
-			err = m.runOpenShiftInstallCommand("wait-for", "install-complete")
+		if (m.waitForInstallCompleteExecutions > 0) && m.isBootstrapComplete() {
+			for i := 0; i < m.waitForInstallCompleteExecutions; i++ {
+				m.log.WithField("waitIteration", i).WithError(err).
+					Warn("provisioning cluster failed after completing bootstrapping, waiting longer for install to complete")
+				err = m.runOpenShiftInstallCommand("wait-for", "install-complete")
+			}
 		}
 		if err != nil {
 			m.log.WithError(err).Error("error provisioning cluster")
@@ -620,7 +695,7 @@ func (m *InstallManager) provisionCluster() error {
 
 func (m *InstallManager) runOpenShiftInstallCommand(args ...string) error {
 	m.log.WithField("args", args).Info("running openshift-install binary")
-	cmd := exec.Command("./openshift-install", args...)
+	cmd := exec.Command(filepath.Join(m.binaryDir, "openshift-install"), args...)
 	cmd.Dir = m.WorkDir
 
 	// save the commands' stdout/stderr to a file
@@ -787,7 +862,7 @@ func (m *InstallManager) gatherLogs(cd *hivev1.ClusterDeployment, sshPrivKeyPath
 func (m *InstallManager) gatherClusterLogs(cd *hivev1.ClusterDeployment) error {
 	m.log.Info("attempting to gather logs with oc adm must-gather")
 	destDir := filepath.Join(m.LogsDir, fmt.Sprintf("%s-must-gather", time.Now().Format("20060102150405")))
-	cmd := exec.Command(filepath.Join(m.WorkDir, "oc"), "adm", "must-gather", "--dest-dir", destDir)
+	cmd := exec.Command(filepath.Join(m.binaryDir, "oc"), "adm", "must-gather", "--dest-dir", destDir)
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env, fmt.Sprintf("KUBECONFIG=%s", filepath.Join(m.WorkDir, "auth", "kubeconfig")))
 	stdout, err := cmd.Output()
@@ -962,49 +1037,6 @@ func (m *InstallManager) gatherBootstrapNodeLogs(cd *hivev1.ClusterDeployment, n
 	return nil
 }
 
-func (m *InstallManager) runGatherScript(bootstrapIP, scriptTemplate, workDir string) (string, error) {
-
-	tmpFile, err := ioutil.TempFile(workDir, "gatherlog")
-	if err != nil {
-		m.log.WithError(err).Error("failed to create temp log gathering file")
-		return "", err
-	}
-	defer os.Remove(tmpFile.Name())
-
-	destTarball := filepath.Join(m.LogsDir, fmt.Sprintf("%s-log-bundle.tar.gz", time.Now().Format("20060102150405")))
-	script := fmt.Sprintf(scriptTemplate, bootstrapIP, bootstrapIP, destTarball)
-	m.log.Debugf("generated script: %s", script)
-
-	if _, err := tmpFile.Write([]byte(script)); err != nil {
-		m.log.WithError(err).Error("failed to write to log gathering file")
-		return "", err
-	}
-	if err := tmpFile.Chmod(0555); err != nil {
-		m.log.WithError(err).Error("failed to set script as executable")
-		return "", err
-	}
-	if err := tmpFile.Close(); err != nil {
-		m.log.WithError(err).Error("failed to close script")
-		return "", err
-	}
-
-	m.log.Info("Gathering logs from bootstrap node")
-	gatherCmd := exec.Command(tmpFile.Name())
-	if err := gatherCmd.Run(); err != nil {
-		m.log.WithError(err).Error("failed while running gather script")
-		return "", err
-	}
-
-	_, err = os.Stat(destTarball)
-	if err != nil {
-		m.log.WithError(err).Error("error while stat-ing log tarball")
-		return "", err
-	}
-	m.log.Infof("cluster logs gathered: %s", destTarball)
-
-	return destTarball, nil
-}
-
 func (m *InstallManager) isBootstrapComplete() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
 	defer cancel()
@@ -1041,10 +1073,20 @@ func uploadAdminKubeconfig(provision *hivev1.ClusterProvision, m *InstallManager
 	m.log.WithField("derivedObject", kubeconfigSecret.Name).Debug("Setting labels on derived object")
 	kubeconfigSecret.Labels = k8slabels.AddLabel(kubeconfigSecret.Labels, constants.ClusterProvisionNameLabel, provision.Name)
 	kubeconfigSecret.Labels = k8slabels.AddLabel(kubeconfigSecret.Labels, constants.SecretTypeLabel, constants.SecretTypeKubeConfig)
-	if err := controllerutil.SetControllerReference(provision, kubeconfigSecret, scheme.Scheme); err != nil {
-		m.log.WithError(err).Error("error setting controller reference on kubeconfig secret")
+
+	provisionGVK, err := apiutil.GVKForObject(provision, scheme.Scheme)
+	if err != nil {
+		m.log.WithError(err).Errorf("error getting GVK for provision")
 		return nil, err
 	}
+
+	kubeconfigSecret.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion:         provisionGVK.GroupVersion().String(),
+		Kind:               provisionGVK.Kind,
+		Name:               provision.Name,
+		UID:                provision.UID,
+		BlockOwnerDeletion: pointer.BoolPtr(true),
+	}}
 
 	if err := createWithRetries(kubeconfigSecret, m); err != nil {
 		return nil, err
@@ -1085,10 +1127,20 @@ func uploadAdminPassword(provision *hivev1.ClusterProvision, m *InstallManager) 
 	m.log.WithField("derivedObject", s.Name).Debug("Setting labels on derived object")
 	s.Labels = k8slabels.AddLabel(s.Labels, constants.ClusterProvisionNameLabel, provision.Name)
 	s.Labels = k8slabels.AddLabel(s.Labels, constants.SecretTypeLabel, constants.SecretTypeKubeAdminCreds)
-	if err := controllerutil.SetControllerReference(provision, s, scheme.Scheme); err != nil {
-		m.log.WithError(err).Error("error setting controller reference on kubeconfig secret")
+
+	provisionGVK, err := apiutil.GVKForObject(provision, scheme.Scheme)
+	if err != nil {
+		m.log.WithError(err).Errorf("error getting GVK for provision")
 		return nil, err
 	}
+
+	s.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion:         provisionGVK.GroupVersion().String(),
+		Kind:               provisionGVK.Kind,
+		Name:               provision.Name,
+		UID:                provision.UID,
+		BlockOwnerDeletion: pointer.BoolPtr(true),
+	}}
 
 	if err := createWithRetries(s, m); err != nil {
 		return nil, err
@@ -1157,7 +1209,7 @@ func (m *InstallManager) cleanupAdminPasswordSecret() error {
 }
 
 // deleteAnyExistingObject will look for any object that exists that matches the passed in 'obj' and will delete it if it exists
-func (m *InstallManager) deleteAnyExistingObject(namespacedName types.NamespacedName, obj runtime.Object) error {
+func (m *InstallManager) deleteAnyExistingObject(namespacedName types.NamespacedName, obj hivev1.MetaRuntimeObject) error {
 	return resource.DeleteAnyExistingObject(m.DynamicClient, namespacedName, obj, m.log)
 }
 

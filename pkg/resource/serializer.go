@@ -44,12 +44,12 @@ func (e *metaTimeExtension) Encode(ptr unsafe.Pointer, stream *json.Stream) {
 	metaTime := reflect2.TypeOf(metav1.Time{}).UnsafeIndirect(ptr).(metav1.Time)
 	data, err := metaTime.MarshalJSON()
 	if err != nil {
-		log.Errorf("cannot marshal %#v as meta time: %v", ptr, err)
+		log.Warnf("cannot marshal %#v as meta time: %v", ptr, err)
 		return
 	}
 	_, err = stream.Write(data)
 	if err != nil {
-		log.Errorf("cannot write serialized time (%s): %v", string(data), err)
+		log.Warnf("cannot write serialized time (%s): %v", string(data), err)
 	}
 }
 
@@ -73,11 +73,10 @@ func (p *jsonPrinter) PrintObj(obj runtime.Object, w io.Writer) error {
 // This is needed for us to prevent patching from happening unnecessarily when applying resources
 // that don't have a timeCreated timestamp. With the default serializer, they output a
 // `timeCreated: null` which always causes a mismatch with whatever's already in the server.
-func (r *Helper) Serialize(obj runtime.Object, scheme *runtime.Scheme) ([]byte, error) {
+func Serialize(obj runtime.Object, scheme *runtime.Scheme) ([]byte, error) {
 	printer := printers.NewTypeSetter(scheme).ToPrinter(&jsonPrinter{})
 	buf := &bytes.Buffer{}
 	if err := printer.PrintObj(obj, buf); err != nil {
-		r.logger.WithError(err).Errorf("cannot serialize runtime object of type %T", obj)
 		return nil, err
 	}
 	return buf.Bytes(), nil

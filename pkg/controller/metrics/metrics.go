@@ -4,26 +4,25 @@ import (
 	"context"
 	"time"
 
-	"github.com/openshift/hive/pkg/imageset"
-
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
-
-	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
-	"github.com/openshift/hive/pkg/constants"
-
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
+	hiveintv1alpha1 "github.com/openshift/hive/pkg/apis/hiveinternal/v1alpha1"
+	"github.com/openshift/hive/pkg/constants"
+	"github.com/openshift/hive/pkg/imageset"
 )
 
 const (
-	controllerName = "metrics"
+	ControllerName = hivev1.MetricsControllerName
 )
 
 var (
@@ -78,36 +77,40 @@ var (
 		Help: "Total number of SyncSetsInstances referencing non-selector SyncSets that have not successfully applied all resources/patches/secrets.",
 	})
 
-	// MetricClusterDeploymentProvisionUnderwaySeconds is a prometheus metric for the number of seconds
-	// between when a still provisioning cluster was created and now.
-	MetricClusterDeploymentProvisionUnderwaySeconds = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "hive_cluster_deployment_provision_underway_seconds",
-			Help: "Length of time a cluster has been provisioning. Goes to 0 on successful install and then will no longer be reported.",
-		},
-		[]string{"cluster_deployment", "namespace", "cluster_type"},
-	)
 	// MetricClusterDeploymentDeprovisioningUnderwaySeconds is a prometheus metric for the number of seconds
 	// between when a still deprovisioning cluster was created and now.
 	MetricClusterDeploymentDeprovisioningUnderwaySeconds = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "hive_cluster_deployment_deprovision_underway_seconds",
 			// Will clear once hive restarts.
-			Help: "Length of time a cluster has been deprovisioning. Goes to 0 on successful deprovision and then will no longer be reported.",
+			Help: "Length of time a cluster has been deprovisioning.",
 		},
 		[]string{"cluster_deployment", "namespace", "cluster_type"},
 	)
-	// MetricControllerReconcileTime tracks the length of time our reconcile loops take. controller-runtime
+	// metricControllerReconcileTime tracks the length of time our reconcile loops take. controller-runtime
 	// technically tracks this for us, but due to bugs currently also includes time in the queue, which leads to
 	// extremely strange results. For now, track our own metric.
-	MetricControllerReconcileTime = prometheus.NewHistogramVec(
+	metricControllerReconcileTime = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "hive_controller_reconcile_seconds",
 			Help:    "Distribution of the length of time each controllers reconcile loop takes.",
 			Buckets: []float64{0.001, 0.01, 0.1, 1, 10, 30, 60, 120},
 		},
-		[]string{"controller"},
+		[]string{"controller", "outcome"},
 	)
+)
+
+// ReconcileOutcome is used in controller "reconcile complete" log entries, and the metricControllerReconcileTime
+// above for controllers where we would like to monitor performance for different types of Reconcile outcomes. To help with
+// prometheus cardinality this set of outcomes should be kept small and only used for coarse and very high value
+// categories. Controllers must report an outcome but can report unspecified if this categorization is not needed.
+type ReconcileOutcome string
+
+const (
+	ReconcileOutcomeUnspecified        ReconcileOutcome = "unspecified"
+	ReconcileOutcomeNoOp               ReconcileOutcome = "no-op"
+	ReconcileOutcomeFullSync           ReconcileOutcome = "full-sync"
+	ReconcileOutcomeClusterSyncCreated ReconcileOutcome = "clustersync-created"
 )
 
 func init() {
@@ -123,9 +126,8 @@ func init() {
 	metrics.Registry.MustRegister(metricSelectorSyncSetClustersUnappliedTotal)
 	metrics.Registry.MustRegister(metricSyncSetsTotal)
 	metrics.Registry.MustRegister(metricSyncSetsUnappliedTotal)
-	metrics.Registry.MustRegister(MetricControllerReconcileTime)
+	metrics.Registry.MustRegister(metricControllerReconcileTime)
 
-	metrics.Registry.MustRegister(MetricClusterDeploymentProvisionUnderwaySeconds)
 	metrics.Registry.MustRegister(MetricClusterDeploymentDeprovisioningUnderwaySeconds)
 }
 
@@ -135,11 +137,11 @@ func Add(mgr manager.Manager) error {
 		Client:   mgr.GetClient(),
 		Interval: 2 * time.Minute,
 	}
+	metrics.Registry.MustRegister(newProvisioningUnderwayCollector(mgr.GetClient()))
 	err := mgr.Add(mc)
 	if err != nil {
 		return err
 	}
-
 	return nil
 }
 
@@ -162,13 +164,9 @@ func (mc *Calculator) Start(stopCh <-chan struct{}) error {
 
 	// Run forever, sleep at the end:
 	wait.Until(func() {
-		start := time.Now()
 		mcLog := log.WithField("controller", "metrics")
-		defer func() {
-			dur := time.Since(start)
-			MetricControllerReconcileTime.WithLabelValues(controllerName).Observe(dur.Seconds())
-			mcLog.WithField("elapsed", dur).Info("reconcile complete")
-		}()
+		recobsrv := NewReconcileObserver(ControllerName, mcLog)
+		defer recobsrv.ObserveControllerReconcileTime()
 
 		mcLog.Info("calculating metrics across all ClusterDeployments")
 		// Load all ClusterDeployments so we can accumulate facts about them.
@@ -185,18 +183,16 @@ func (mc *Calculator) Start(stopCh <-chan struct{}) error {
 			for _, cd := range clusterDeployments.Items {
 				accumulator.processCluster(&cd)
 
-				if cd.DeletionTimestamp == nil {
-					if !cd.Spec.Installed {
-						// Similarly for installing clusters we report the seconds since
-						// cluster was created. clusterdeployment_controller should set to 0
-						// once we know we've first observed install success, and then this
-						// metric should no longer be reported.
-						MetricClusterDeploymentProvisionUnderwaySeconds.WithLabelValues(
-							cd.Name,
-							cd.Namespace,
-							GetClusterDeploymentType(&cd)).Set(
-							time.Since(cd.CreationTimestamp.Time).Seconds())
-					}
+				if cd.DeletionTimestamp != nil {
+
+					// For deprovisioning clusters we report the seconds since
+					// cluster was deleted. clusterdeployment_controller should delete this
+					// when removing the finalizer.
+					MetricClusterDeploymentDeprovisioningUnderwaySeconds.WithLabelValues(
+						cd.Name,
+						cd.Namespace,
+						GetClusterDeploymentType(&cd)).Set(
+						time.Since(cd.CreationTimestamp.Time).Seconds())
 				}
 			}
 
@@ -286,20 +282,17 @@ func (mc *Calculator) Start(stopCh <-chan struct{}) error {
 		}
 
 		mc.calculateSelectorSyncSetMetrics(mcLog)
-
-		elapsed := time.Since(start)
-		mcLog.WithField("elapsed", elapsed).Info("metrics calculation complete")
 	}, mc.Interval, stopCh)
 
 	return nil
 }
 
 func (mc *Calculator) calculateSelectorSyncSetMetrics(mcLog log.FieldLogger) {
-	mcLog.Debug("calculating metrics across all SyncSetInstances")
-	ssis := &hivev1.SyncSetInstanceList{}
-	err := mc.Client.List(context.Background(), ssis)
+	mcLog.Debug("calculating metrics across all ClusterSyncs")
+	clusterSyncList := &hiveintv1alpha1.ClusterSyncList{}
+	err := mc.Client.List(context.Background(), clusterSyncList)
 	if err != nil {
-		mcLog.WithError(err).Error("error listing all SyncSetInstances")
+		mcLog.WithError(err).Error("error listing all ClusterSyncs")
 		return
 	}
 
@@ -308,23 +301,31 @@ func (mc *Calculator) calculateSelectorSyncSetMetrics(mcLog log.FieldLogger) {
 
 	ssInstancesTotal := 0
 	ssInstancesUnappliedTotal := 0
-	for _, ssi := range ssis.Items {
-		if sss := ssi.Spec.SelectorSyncSetRef; sss != nil {
-			// Process SyncSetInstances with a SelectorSyncSet reference:
+	for _, cs := range clusterSyncList.Items {
+		for _, sss := range cs.Status.SelectorSyncSets {
 			sssInstancesTotal[sss.Name]++
-			if !ssi.Status.Applied {
+			if sss.Result != hiveintv1alpha1.SuccessSyncSetResult {
 				sssInstancesUnappliedTotal[sss.Name]++
 			}
-		} else {
-			// Process SyncSetInstances with a non-selector SyncSet reference:
+		}
+		for _, ss := range cs.Status.SyncSets {
 			ssInstancesTotal++
-			if !ssi.Status.Applied {
+			if ss.Result != hiveintv1alpha1.SuccessSyncSetResult {
 				ssInstancesUnappliedTotal++
 			}
 		}
 	}
 	for k, v := range sssInstancesTotal {
 		metricSelectorSyncSetClustersTotal.WithLabelValues(k).Set(float64(v))
+		// If this selector sync set currently has no unapplied instances, ensure any past unapplied metric is cleared:
+		if sssInstancesUnappliedTotal[k] == 0 {
+			cleared := metricSelectorSyncSetClustersUnappliedTotal.Delete(map[string]string{
+				"name": k,
+			})
+			if cleared {
+				mcLog.Debugf("cleared selector syncset clusters unapplied metric for cluster: %s", k)
+			}
+		}
 	}
 	for k, v := range sssInstancesUnappliedTotal {
 		metricSelectorSyncSetClustersUnappliedTotal.WithLabelValues(k).Set(float64(v))
@@ -506,6 +507,13 @@ func (ca *clusterAccumulator) processCluster(cd *hivev1.ClusterDeployment) {
 	// Process conditions regardless if installed or not:
 	for _, cond := range cd.Status.Conditions {
 		if cond.Status == corev1.ConditionTrue {
+			// Should have been handled by the initialization above which ensures we have 0's in the metrics for
+			// conditions that are not currently present on any clusters. This is a safety check to avoid crashing Hive
+			// in the event a developer adds a new condition but misses the list of all types.
+			if ca.conditions[cond.Type] == nil {
+				log.Warnf("condition type %s missing from AllClusterDeploymentConditions slice", cond.Type)
+				ca.conditions[cond.Type] = map[string]int{}
+			}
 			ca.conditions[cond.Type][clusterType]++
 		}
 	}
@@ -558,3 +566,44 @@ func GetClusterDeploymentType(obj metav1.Object) string {
 	}
 	return hivev1.DefaultClusterType
 }
+
+// ReconcileObserver is used to track, log, and report metrics for controller reconcile time and outcome. Each
+// controller should instantiate one near the start of the reconcile loop, and defer a call to
+// ObserveControllerReconcileTime.
+type ReconcileObserver struct {
+	startTime      time.Time
+	controllerName hivev1.ControllerName
+	logger         log.FieldLogger
+	outcome        ReconcileOutcome
+}
+
+func NewReconcileObserver(controllerName hivev1.ControllerName, logger log.FieldLogger) *ReconcileObserver {
+	return &ReconcileObserver{
+		startTime:      time.Now(),
+		controllerName: controllerName,
+		logger:         logger,
+		outcome:        ReconcileOutcomeUnspecified,
+	}
+}
+
+func (ro *ReconcileObserver) ObserveControllerReconcileTime() {
+	dur := time.Since(ro.startTime)
+	metricControllerReconcileTime.WithLabelValues(string(ro.controllerName), string(ro.outcome)).Observe(dur.Seconds())
+	fields := log.Fields{"elapsedMillis": dur.Milliseconds(), "outcome": ro.outcome}
+	// Add a log field to categorize request duration into buckets. We can't easily query > in Kibana in
+	// OpenShift deployments due to logging limitations, so these constant buckets give us a small number of
+	// constant search strings we can use to identify slow reconcile loops.
+	for _, bucket := range elapsedDurationBuckets {
+		if dur >= bucket {
+			fields["elapsedMillisGT"] = bucket.Milliseconds()
+			break
+		}
+	}
+	ro.logger.WithFields(fields).Info("reconcile complete")
+}
+
+func (ro *ReconcileObserver) SetOutcome(outcome ReconcileOutcome) {
+	ro.outcome = outcome
+}
+
+var elapsedDurationBuckets = []time.Duration{2 * time.Minute, time.Minute, 30 * time.Second, 10 * time.Second, 5 * time.Second, time.Second, 0}

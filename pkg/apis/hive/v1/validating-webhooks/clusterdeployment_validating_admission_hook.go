@@ -1,11 +1,11 @@
 package validatingwebhooks
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
@@ -19,9 +19,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
-
+	"github.com/openshift/hive/pkg/constants"
 	"github.com/openshift/hive/pkg/manageddns"
 )
 
@@ -35,16 +36,17 @@ const (
 )
 
 var (
-	mutableFields = []string{"CertificateBundles", "ClusterMetadata", "ControlPlaneConfig", "Ingress", "Installed", "PreserveOnDelete"}
+	mutableFields = []string{"CertificateBundles", "ClusterMetadata", "ControlPlaneConfig", "Ingress", "Installed", "PreserveOnDelete", "ClusterPoolRef", "PowerState", "HibernateAfter"}
 )
 
 // ClusterDeploymentValidatingAdmissionHook is a struct that is used to reference what code should be run by the generic-admission-server.
 type ClusterDeploymentValidatingAdmissionHook struct {
+	decoder             *admission.Decoder
 	validManagedDomains []string
 }
 
 // NewClusterDeploymentValidatingAdmissionHook constructs a new ClusterDeploymentValidatingAdmissionHook
-func NewClusterDeploymentValidatingAdmissionHook() *ClusterDeploymentValidatingAdmissionHook {
+func NewClusterDeploymentValidatingAdmissionHook(decoder *admission.Decoder) *ClusterDeploymentValidatingAdmissionHook {
 	logger := log.WithField("validating_webhook", "clusterdeployment")
 	managedDomains, err := manageddns.ReadManagedDomainsFile()
 	if err != nil {
@@ -56,6 +58,7 @@ func NewClusterDeploymentValidatingAdmissionHook() *ClusterDeploymentValidatingA
 	}
 	logger.WithField("managedDomains", domains).Info("Read managed domains")
 	return &ClusterDeploymentValidatingAdmissionHook{
+		decoder:             decoder,
 		validManagedDomains: domains,
 	}
 }
@@ -112,18 +115,18 @@ func (a *ClusterDeploymentValidatingAdmissionHook) Validate(admissionSpec *admis
 
 	contextLogger.Info("Validating request")
 
-	if admissionSpec.Operation == admissionv1beta1.Create {
+	switch admissionSpec.Operation {
+	case admissionv1beta1.Create:
 		return a.validateCreate(admissionSpec)
-	}
-
-	if admissionSpec.Operation == admissionv1beta1.Update {
+	case admissionv1beta1.Update:
 		return a.validateUpdate(admissionSpec)
-	}
-
-	// We're only validating creates and updates at this time, so all other operations are explicitly allowed.
-	contextLogger.Info("Successful validation")
-	return &admissionv1beta1.AdmissionResponse{
-		Allowed: true,
+	case admissionv1beta1.Delete:
+		return a.validateDelete(admissionSpec)
+	default:
+		contextLogger.Info("Successful validation")
+		return &admissionv1beta1.AdmissionResponse{
+			Allowed: true,
+		}
 	}
 }
 
@@ -169,8 +172,7 @@ func (a *ClusterDeploymentValidatingAdmissionHook) validateCreate(admissionSpec 
 	})
 
 	newObject := &hivev1.ClusterDeployment{}
-	err := json.Unmarshal(admissionSpec.Object.Raw, newObject)
-	if err != nil {
+	if err := a.decoder.DecodeRaw(admissionSpec.Object, newObject); err != nil {
 		contextLogger.Errorf("Failed unmarshaling Object: %v", err.Error())
 		return &admissionv1beta1.AdmissionResponse{
 			Allowed: false,
@@ -245,63 +247,18 @@ func (a *ClusterDeploymentValidatingAdmissionHook) validateCreate(admissionSpec 
 		}
 	}
 
-	platformPath := specPath.Child("platform")
-	numberOfPlatforms := 0
-	canManageDNS := false
-	if newObject.Spec.Platform.AWS != nil {
-		numberOfPlatforms++
-		canManageDNS = true
-		aws := newObject.Spec.Platform.AWS
-		awsPath := platformPath.Child("aws")
-		if aws.CredentialsSecretRef.Name == "" {
-			allErrs = append(allErrs, field.Required(awsPath.Child("credentialsSecretRef", "name"), "must specify secrets for AWS access"))
-		}
-		if aws.Region == "" {
-			allErrs = append(allErrs, field.Required(awsPath.Child("region"), "must specify AWS region"))
-		}
-	}
-	if newObject.Spec.Platform.Azure != nil {
-		numberOfPlatforms++
-		azure := newObject.Spec.Platform.Azure
-		azurePath := platformPath.Child("azure")
-		if azure.CredentialsSecretRef.Name == "" {
-			allErrs = append(allErrs, field.Required(azurePath.Child("credentialsSecretRef", "name"), "must specify secrets for Azure access"))
-		}
-		if azure.Region == "" {
-			allErrs = append(allErrs, field.Required(azurePath.Child("region"), "must specify Azure region"))
-		}
-		if azure.BaseDomainResourceGroupName == "" {
-			allErrs = append(allErrs, field.Required(azurePath.Child("baseDomainResourceGroupName"), "must specify the Azure resource group for the base domain"))
-		}
-	}
-	if newObject.Spec.Platform.GCP != nil {
-		numberOfPlatforms++
-		canManageDNS = true
-		gcp := newObject.Spec.Platform.GCP
-		gcpPath := platformPath.Child("gcp")
-		if gcp.CredentialsSecretRef.Name == "" {
-			allErrs = append(allErrs, field.Required(gcpPath.Child("credentialsSecretRef", "name"), "must specify secrets for GCP access"))
-		}
-		if gcp.Region == "" {
-			allErrs = append(allErrs, field.Required(gcpPath.Child("region"), "must specify GCP region"))
-		}
-	}
-	if newObject.Spec.Platform.BareMetal != nil {
-		numberOfPlatforms++
-	}
-	switch {
-	case numberOfPlatforms == 0:
-		allErrs = append(allErrs, field.Required(platformPath, "must specify a platform"))
-	case numberOfPlatforms > 1:
-		allErrs = append(allErrs, field.Invalid(platformPath, newObject.Spec.Platform, "must specify only a single platform"))
-	}
-	if !canManageDNS && newObject.Spec.ManageDNS {
-		allErrs = append(allErrs, field.Invalid(specPath.Child("manageDNS"), newObject.Spec.ManageDNS, "cannot manage DNS for the selected platform"))
-	}
+	allErrs = append(allErrs, validateClusterPlatform(specPath.Child("platform"), newObject.Spec.Platform)...)
+	allErrs = append(allErrs, validateCanManageDNSForClusterPlatform(specPath, newObject.Spec)...)
 
 	if newObject.Spec.Provisioning != nil {
 		if newObject.Spec.Provisioning.SSHPrivateKeySecretRef != nil && newObject.Spec.Provisioning.SSHPrivateKeySecretRef.Name == "" {
 			allErrs = append(allErrs, field.Required(specPath.Child("provisioning", "sshPrivateKeySecretRef", "name"), "must specify a name for the ssh private key secret if the ssh private key secret is specified"))
+		}
+	}
+
+	if poolRef := newObject.Spec.ClusterPoolRef; poolRef != nil {
+		if claimName := poolRef.ClaimName; claimName != "" {
+			allErrs = append(allErrs, field.Invalid(specPath.Child("clusterPoolRef", "claimName"), claimName, "cannot create a ClusterDeployment that is already claimed"))
 		}
 	}
 
@@ -320,6 +277,117 @@ func (a *ClusterDeploymentValidatingAdmissionHook) validateCreate(admissionSpec 
 	}
 }
 
+func validateClusterPlatform(path *field.Path, platform hivev1.Platform) field.ErrorList {
+	allErrs := field.ErrorList{}
+	numberOfPlatforms := 0
+	if aws := platform.AWS; aws != nil {
+		numberOfPlatforms++
+		awsPath := path.Child("aws")
+		if aws.CredentialsSecretRef.Name == "" {
+			allErrs = append(allErrs, field.Required(awsPath.Child("credentialsSecretRef", "name"), "must specify secrets for AWS access"))
+		}
+		if aws.Region == "" {
+			allErrs = append(allErrs, field.Required(awsPath.Child("region"), "must specify AWS region"))
+		}
+	}
+	if azure := platform.Azure; azure != nil {
+		numberOfPlatforms++
+		azurePath := path.Child("azure")
+		if azure.CredentialsSecretRef.Name == "" {
+			allErrs = append(allErrs, field.Required(azurePath.Child("credentialsSecretRef", "name"), "must specify secrets for Azure access"))
+		}
+		if azure.Region == "" {
+			allErrs = append(allErrs, field.Required(azurePath.Child("region"), "must specify Azure region"))
+		}
+		if azure.BaseDomainResourceGroupName == "" {
+			allErrs = append(allErrs, field.Required(azurePath.Child("baseDomainResourceGroupName"), "must specify the Azure resource group for the base domain"))
+		}
+	}
+	if gcp := platform.GCP; gcp != nil {
+		numberOfPlatforms++
+		gcpPath := path.Child("gcp")
+		if gcp.CredentialsSecretRef.Name == "" {
+			allErrs = append(allErrs, field.Required(gcpPath.Child("credentialsSecretRef", "name"), "must specify secrets for GCP access"))
+		}
+		if gcp.Region == "" {
+			allErrs = append(allErrs, field.Required(gcpPath.Child("region"), "must specify GCP region"))
+		}
+	}
+	if openstack := platform.OpenStack; openstack != nil {
+		numberOfPlatforms++
+		openstackPath := path.Child("openStack")
+		if openstack.CredentialsSecretRef.Name == "" {
+			allErrs = append(allErrs, field.Required(openstackPath.Child("credentialsSecretRef", "name"), "must specify secrets for OpenStack access"))
+		}
+		if openstack.Cloud == "" {
+			allErrs = append(allErrs, field.Required(openstackPath.Child("cloud"), "must specify cloud section of credentials secret to use"))
+		}
+	}
+	if vsphere := platform.VSphere; vsphere != nil {
+		numberOfPlatforms++
+		vspherePath := path.Child("vsphere")
+		if vsphere.CredentialsSecretRef.Name == "" {
+			allErrs = append(allErrs, field.Required(vspherePath.Child("credentialsSecretRef", "name"), "must specify secrets for vSphere access"))
+		}
+		if vsphere.CertificatesSecretRef.Name == "" {
+			allErrs = append(allErrs, field.Required(vspherePath.Child("certificatesSecretRef", "name"), "must specify certificates for vSphere access"))
+		}
+		if vsphere.VCenter == "" {
+			allErrs = append(allErrs, field.Required(vspherePath.Child("vCenter"), "must specify vSphere vCenter"))
+		}
+		if vsphere.Datacenter == "" {
+			allErrs = append(allErrs, field.Required(vspherePath.Child("datacenter"), "must specify vSphere datacenter"))
+		}
+		if vsphere.DefaultDatastore == "" {
+			allErrs = append(allErrs, field.Required(vspherePath.Child("defaultDatastore"), "must specify vSphere defaultDatastore"))
+		}
+	}
+	if ovirt := platform.Ovirt; ovirt != nil {
+		numberOfPlatforms++
+		ovirtPath := path.Child("ovirt")
+		if ovirt.CredentialsSecretRef.Name == "" {
+			allErrs = append(allErrs, field.Required(ovirtPath.Child("credentialsSecretRef", "name"), "must specify secrets for oVirt access"))
+		}
+		if ovirt.CertificatesSecretRef.Name == "" {
+			allErrs = append(allErrs, field.Required(ovirtPath.Child("certificatesSecretRef", "name"), "must specify certificates for oVirt access"))
+		}
+		if ovirt.ClusterID == "" {
+			allErrs = append(allErrs, field.Required(ovirtPath.Child("ovirt_cluster_id"), "must specify ovirt_cluster_id"))
+		}
+		if ovirt.StorageDomainID == "" {
+			allErrs = append(allErrs, field.Required(ovirtPath.Child("ovirt_storage_domain_id"), "must specify ovirt_storage_domain_id"))
+		}
+	}
+	if baremetal := platform.BareMetal; baremetal != nil {
+		numberOfPlatforms++
+	}
+	switch {
+	case numberOfPlatforms == 0:
+		allErrs = append(allErrs, field.Required(path, "must specify a platform"))
+	case numberOfPlatforms > 1:
+		allErrs = append(allErrs, field.Invalid(path, platform, "must specify only a single platform"))
+	}
+	return allErrs
+}
+
+func validateCanManageDNSForClusterPlatform(specPath *field.Path, spec hivev1.ClusterDeploymentSpec) field.ErrorList {
+	allErrs := field.ErrorList{}
+	canManageDNS := false
+	if spec.Platform.AWS != nil {
+		canManageDNS = true
+	}
+	if spec.Platform.Azure != nil {
+		canManageDNS = true
+	}
+	if spec.Platform.GCP != nil {
+		canManageDNS = true
+	}
+	if !canManageDNS && spec.ManageDNS {
+		allErrs = append(allErrs, field.Invalid(specPath.Child("manageDNS"), spec.ManageDNS, "cannot manage DNS for the selected platform"))
+	}
+	return allErrs
+}
+
 // validateUpdate specifically validates update operations for ClusterDeployment objects.
 func (a *ClusterDeploymentValidatingAdmissionHook) validateUpdate(admissionSpec *admissionv1beta1.AdmissionRequest) *admissionv1beta1.AdmissionResponse {
 	contextLogger := log.WithFields(log.Fields{
@@ -331,8 +399,7 @@ func (a *ClusterDeploymentValidatingAdmissionHook) validateUpdate(admissionSpec 
 	})
 
 	newObject := &hivev1.ClusterDeployment{}
-	err := json.Unmarshal(admissionSpec.Object.Raw, newObject)
-	if err != nil {
+	if err := a.decoder.DecodeRaw(admissionSpec.Object, newObject); err != nil {
 		contextLogger.Errorf("Failed unmarshaling Object: %v", err.Error())
 		return &admissionv1beta1.AdmissionResponse{
 			Allowed: false,
@@ -347,8 +414,7 @@ func (a *ClusterDeploymentValidatingAdmissionHook) validateUpdate(admissionSpec 
 	contextLogger.Data["object.Name"] = newObject.Name
 
 	oldObject := &hivev1.ClusterDeployment{}
-	err = json.Unmarshal(admissionSpec.OldObject.Raw, oldObject)
-	if err != nil {
+	if err := a.decoder.DecodeRaw(admissionSpec.OldObject, oldObject); err != nil {
 		contextLogger.Errorf("Failed unmarshaling OldObject: %v", err.Error())
 		return &admissionv1beta1.AdmissionResponse{
 			Allowed: false,
@@ -413,6 +479,20 @@ func (a *ClusterDeploymentValidatingAdmissionHook) validateUpdate(admissionSpec 
 		}
 	}
 
+	// Validate the ClusterPoolRef:
+	switch oldPoolRef, newPoolRef := oldObject.Spec.ClusterPoolRef, newObject.Spec.ClusterPoolRef; {
+	case oldPoolRef != nil && newPoolRef != nil:
+		allErrs = append(allErrs, apivalidation.ValidateImmutableField(newPoolRef.Namespace, oldPoolRef.Namespace, specPath.Child("clusterPoolRef", "namespace"))...)
+		allErrs = append(allErrs, apivalidation.ValidateImmutableField(newPoolRef.PoolName, oldPoolRef.PoolName, specPath.Child("clusterPoolRef", "poolName"))...)
+		if oldClaim := oldPoolRef.ClaimName; oldClaim != "" {
+			allErrs = append(allErrs, apivalidation.ValidateImmutableField(newPoolRef.ClaimName, oldClaim, specPath.Child("clusterPoolRef", "claimName"))...)
+		}
+	case oldPoolRef != nil && newPoolRef == nil:
+		allErrs = append(allErrs, field.Invalid(specPath.Child("clusterPoolRef"), newPoolRef, "cannot remove clusterPoolRef"))
+	case oldPoolRef == nil && newPoolRef != nil:
+		allErrs = append(allErrs, field.Invalid(specPath.Child("clusterPoolRef"), newPoolRef, "cannot add clusterPoolRef"))
+	}
+
 	if len(allErrs) > 0 {
 		contextLogger.WithError(allErrs.ToAggregate()).Info("failed validation")
 		status := errors.NewInvalid(schemaGVK(admissionSpec.Kind).GroupKind(), admissionSpec.Name, allErrs).Status()
@@ -424,6 +504,67 @@ func (a *ClusterDeploymentValidatingAdmissionHook) validateUpdate(admissionSpec 
 
 	// If we get here, then all checks passed, so the object is valid.
 	contextLogger.Info("Successful validation")
+	return &admissionv1beta1.AdmissionResponse{
+		Allowed: true,
+	}
+}
+
+// validateDelete specifically validates delete operations for ClusterDeployment objects.
+func (a *ClusterDeploymentValidatingAdmissionHook) validateDelete(request *admissionv1beta1.AdmissionRequest) *admissionv1beta1.AdmissionResponse {
+	logger := log.WithFields(log.Fields{
+		"operation": request.Operation,
+		"group":     request.Resource.Group,
+		"version":   request.Resource.Version,
+		"resource":  request.Resource.Resource,
+		"method":    "validateDelete",
+	})
+
+	// If running on OpenShift 3.11, OldObject will not be populated. All we can do is accept the DELETE request.
+	if len(request.OldObject.Raw) == 0 {
+		logger.Info("Cannot validate the DELETE since OldObject is empty")
+		return &admissionv1beta1.AdmissionResponse{
+			Allowed: true,
+		}
+	}
+
+	oldObject := &hivev1.ClusterDeployment{}
+	if err := a.decoder.DecodeRaw(request.OldObject, oldObject); err != nil {
+		logger.Errorf("Failed unmarshaling Object: %v", err.Error())
+		return &admissionv1beta1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Status: metav1.StatusFailure, Code: http.StatusBadRequest, Reason: metav1.StatusReasonBadRequest,
+				Message: err.Error(),
+			},
+		}
+	}
+
+	logger.Data["object.Name"] = oldObject.Name
+
+	var allErrs field.ErrorList
+
+	if value, present := oldObject.Annotations[constants.ProtectedDeleteAnnotation]; present {
+		if enabled, err := strconv.ParseBool(value); enabled && err == nil {
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("metadata", "annotations", constants.ProtectedDeleteAnnotation),
+				oldObject.Annotations[constants.ProtectedDeleteAnnotation],
+				"cannot delete while annotation is present",
+			))
+		} else {
+			logger.WithField(constants.ProtectedDeleteAnnotation, value).Info("Protected Delete annotation present but not set to true")
+		}
+	}
+
+	if len(allErrs) > 0 {
+		logger.WithError(allErrs.ToAggregate()).Info("failed validation")
+		status := errors.NewInvalid(schemaGVK(request.Kind).GroupKind(), request.Name, allErrs).Status()
+		return &admissionv1beta1.AdmissionResponse{
+			Allowed: false,
+			Result:  &status,
+		}
+	}
+
+	logger.Info("Successful validation")
 	return &admissionv1beta1.AdmissionResponse{
 		Allowed: true,
 	}
@@ -530,15 +671,22 @@ func validateIngressList(newObject *hivev1.ClusterDeploymentSpec) bool {
 }
 
 func validateDomain(domain string, validDomains []string) bool {
+	matchFound := false
 	for _, validDomain := range validDomains {
-		if strings.HasSuffix(domain, "."+validDomain) {
-			childPart := strings.TrimSuffix(domain, "."+validDomain)
-			if !strings.Contains(childPart, ".") {
-				return true
-			}
+		// Do not allow the base domain to be the same as one of the managed domains.
+		if domain == validDomain {
+			return false
+		}
+		dottedValidDomain := "." + validDomain
+		if !strings.HasSuffix(domain, dottedValidDomain) {
+			continue
+		}
+		childPart := strings.TrimSuffix(domain, dottedValidDomain)
+		if !strings.ContainsRune(childPart, '.') {
+			matchFound = true
 		}
 	}
-	return false
+	return matchFound
 }
 
 func validateIngress(newObject *hivev1.ClusterDeployment, contextLogger *log.Entry) *admissionv1beta1.AdmissionResponse {

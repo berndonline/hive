@@ -3,24 +3,31 @@ package remotemachineset
 import (
 	"context"
 	"fmt"
-	machineapi "github.com/openshift/cluster-api/pkg/apis/machine/v1beta1"
-	controllerutils "github.com/openshift/hive/pkg/controller/utils"
+	"math/rand"
+	"strings"
+
+	"github.com/blang/semver/v4"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
+
+	gcpprovider "github.com/openshift/cluster-api-provider-gcp/pkg/apis"
+	gcpproviderv1beta1 "github.com/openshift/cluster-api-provider-gcp/pkg/apis/gcpprovider/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/pointer"
-	"math/rand"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	machineapi "github.com/openshift/cluster-api/pkg/apis/machine/v1beta1"
 	installgcp "github.com/openshift/installer/pkg/asset/machines/gcp"
 	installertypes "github.com/openshift/installer/pkg/types"
 	installertypesgcp "github.com/openshift/installer/pkg/types/gcp"
 
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
 	"github.com/openshift/hive/pkg/constants"
+	controllerutils "github.com/openshift/hive/pkg/controller/utils"
 	"github.com/openshift/hive/pkg/gcpclient"
 )
 
@@ -28,10 +35,10 @@ const (
 	// Omit m, the installer used this for the master machines. w is also removed as this is implicitly used
 	// by the installer for the original worker pool.
 	validLeaseChars = "abcdefghijklnopqrstuvxyz0123456789"
+)
 
-	// workerRole is assumed role name for workers, used to locate several resources the installer
-	// would have created in GCP.
-	workerRole = "worker"
+var (
+	versionsSupportingFullNames = semver.MustParseRange(">=4.4.7")
 )
 
 // GCPActuator encapsulates the pieces necessary to be able to generate
@@ -42,17 +49,30 @@ type GCPActuator struct {
 	logger    log.FieldLogger
 	scheme    *runtime.Scheme
 	projectID string
+	imageID   string
 	// expectations is a reference to the reconciler's TTLCache of machinepoolnamelease creates each machinepool
 	// expects to see.
-	expectations controllerutils.ExpectationsInterface
+	expectations   controllerutils.ExpectationsInterface
+	leasesRequired bool
 }
 
 var _ Actuator = &GCPActuator{}
 
-// NewGCPActuator is the constructor for building a GCPActuator
-func NewGCPActuator(client client.Client, gcpCreds *corev1.Secret, scheme *runtime.Scheme,
-	expectations controllerutils.ExpectationsInterface, logger log.FieldLogger) (*GCPActuator, error) {
+func addGCPProviderToScheme(scheme *runtime.Scheme) error {
+	return gcpprovider.AddToScheme(scheme)
+}
 
+// NewGCPActuator is the constructor for building a GCPActuator
+func NewGCPActuator(
+	client client.Client,
+	gcpCreds *corev1.Secret,
+	clusterVersion string,
+	masterMachine *machineapi.Machine,
+	remoteMachineSets []machineapi.MachineSet,
+	scheme *runtime.Scheme,
+	expectations controllerutils.ExpectationsInterface,
+	logger log.FieldLogger,
+) (*GCPActuator, error) {
 	gcpClient, err := gcpclient.NewClientFromSecret(gcpCreds)
 	if err != nil {
 		logger.WithError(err).Warn("failed to create GCP client with creds in clusterDeployment's secret")
@@ -65,13 +85,21 @@ func NewGCPActuator(client client.Client, gcpCreds *corev1.Secret, scheme *runti
 		return nil, err
 	}
 
+	imageID, err := getGCPImageID(masterMachine, scheme, logger)
+	if err != nil {
+		logger.WithError(err).Error("error getting image ID from master machine")
+		return nil, err
+	}
+
 	actuator := &GCPActuator{
-		gcpClient:    gcpClient,
-		client:       client,
-		logger:       logger,
-		scheme:       scheme,
-		expectations: expectations,
-		projectID:    projectID,
+		gcpClient:      gcpClient,
+		client:         client,
+		logger:         logger,
+		scheme:         scheme,
+		expectations:   expectations,
+		projectID:      projectID,
+		imageID:        imageID,
+		leasesRequired: requireLeases(clusterVersion, remoteMachineSets, logger),
 	}
 	return actuator, nil
 }
@@ -89,14 +117,44 @@ func (a *GCPActuator) GenerateMachineSets(cd *hivev1.ClusterDeployment, pool *hi
 		return nil, false, errors.New("MachinePool is not for GCP")
 	}
 
-	leaseChar, proceed, err := a.obtainLease(pool, cd, logger)
-	if err != nil {
-		logger.WithError(err).Log(controllerutils.LogLevel(err), "error obtaining pool name lease")
+	leases := &hivev1.MachinePoolNameLeaseList{}
+	if err := a.client.List(
+		context.TODO(),
+		leases,
+		client.InNamespace(pool.Namespace),
+		client.MatchingLabels(map[string]string{
+			constants.ClusterDeploymentNameLabel: cd.Name,
+		}),
+	); err != nil {
+		logger.WithError(err).Log(controllerutils.LogLevel(err), "error fetching machinepoolleases")
 		return nil, false, err
 	}
 
-	if !proceed {
-		return nil, false, nil
+	poolName := pool.Spec.Name
+
+	// If leases are required by the cluster version or existing "w" worker machinesets in the cluster or are already
+	// being used as indicated by the existence of MachinePoolLeases, then use leases for determining the machine pool
+	// name.
+	useLeases := true
+	switch {
+	case a.leasesRequired:
+		logger.Debug("using leases since they are required by the cluster")
+	case len(leases.Items) > 0:
+		logger.Debug("using leases since there are existing MachinePoolNameLeases")
+	default:
+		logger.Debug("not using leases")
+		useLeases = false
+	}
+	if useLeases {
+		leaseChar, proceed, err := a.obtainLease(pool, cd, leases)
+		if err != nil {
+			logger.WithError(err).Log(controllerutils.LogLevel(err), "error obtaining pool name lease")
+			return nil, false, err
+		}
+		if !proceed {
+			return nil, false, nil
+		}
+		poolName = leaseChar
 	}
 
 	ic := &installertypes.InstallConfig{
@@ -109,15 +167,14 @@ func (a *GCPActuator) GenerateMachineSets(cd *hivev1.ClusterDeployment, pool *hi
 	}
 
 	computePool := baseMachinePool(pool)
+	computePool.Name = poolName
 	computePool.Platform.GCP = &installertypesgcp.MachinePool{
 		Zones:        pool.Spec.Platform.GCP.Zones,
 		InstanceType: pool.Spec.Platform.GCP.InstanceType,
-	}
-
-	// get image ID for the generated machine sets
-	imageID, err := a.getImageID(cd, logger)
-	if err != nil {
-		return nil, false, errors.Wrap(err, "failed to find image ID for the machine sets")
+		OSDisk: installertypesgcp.OSDisk{
+			DiskType:   "pd-ssd",
+			DiskSizeGB: 128,
+		},
 	}
 
 	if len(computePool.Platform.GCP.Zones) == 0 {
@@ -131,11 +188,15 @@ func (a *GCPActuator) GenerateMachineSets(cd *hivev1.ClusterDeployment, pool *hi
 		computePool.Platform.GCP.Zones = zones
 	}
 
-	// Installer code uses the first character of the computePool.Name in the MachineSet name,
-	// so we need to fake it to get it to use our leaseChar.
-	computePool.Name = string(leaseChar)
 	// Assuming all machine pools are workers at this time.
-	installerMachineSets, err := installgcp.MachineSets(cd.Spec.ClusterMetadata.InfraID, ic, computePool, imageID, workerRole, "worker-user-data")
+	installerMachineSets, err := installgcp.MachineSets(
+		cd.Spec.ClusterMetadata.InfraID,
+		ic,
+		computePool,
+		a.imageID,
+		workerRole,
+		workerUserDataName,
+	)
 	return installerMachineSets, err == nil, errors.Wrap(err, "failed to generate machinesets")
 }
 
@@ -169,50 +230,14 @@ func (a *GCPActuator) getZones(region string) ([]string, error) {
 	return zones, nil
 }
 
-func (a *GCPActuator) getImageID(cd *hivev1.ClusterDeployment, logger log.FieldLogger) (string, error) {
-	infra := cd.Spec.ClusterMetadata.InfraID
-
-	// find names of the form '<infra>-.*'
-	filter := fmt.Sprintf("name eq \"%s-.*\"", infra)
-	result, err := a.gcpClient.ListComputeImages(gcpclient.ListComputeImagesOptions{Filter: filter})
-	if err != nil {
-		logger.WithError(err).Warnf("failed to find a GCP image starting with name: %s", infra)
-		return "", err
-	}
-	switch len(result.Items) {
-	case 0:
-		msg := fmt.Sprintf("found 0 results searching for GCP image starting with name: %s", infra)
-		logger.Warnf(msg)
-		return "", errors.New(msg)
-	case 1:
-		logger.Debugf("using image with name %s for machine sets", result.Items[0].Name)
-		return result.Items[0].Name, nil
-	default:
-		msg := fmt.Sprintf("unexpected number of results when looking for GCP image with name starting with %s", infra)
-		logger.Warnf(msg)
-		return "", errors.New(msg)
-	}
-}
-
 // obtainLease uses the Hive MachinePoolNameLease resource to obtain a unique, single character
 // for use in the name of the machine pool. We are severely restricted on name lengths on GCP
 // and effectively have one character of flexibility with the naming convention originating in
 // the installer.
-func (a *GCPActuator) obtainLease(pool *hivev1.MachinePool, cd *hivev1.ClusterDeployment, logger log.FieldLogger) (leaseChar string, proceed bool, leaseErr error) {
-	logger.Debugf("obtaining lease for pool: %s", pool.Name)
-
-	leases := &hivev1.MachinePoolNameLeaseList{}
-	err := a.client.List(context.TODO(), leases, client.InNamespace(pool.Namespace),
-		client.MatchingLabels(map[string]string{
-			constants.ClusterDeploymentNameLabel: cd.Name,
-		}))
-	if err != nil {
-		return "", false, err
-	}
-	logger.Debugf("found %d leases for cluster", len(leases.Items))
+func (a *GCPActuator) obtainLease(pool *hivev1.MachinePool, cd *hivev1.ClusterDeployment, leases *hivev1.MachinePoolNameLeaseList) (leaseChar string, proceed bool, leaseErr error) {
 	for _, l := range leases.Items {
 		if l.Labels[constants.MachinePoolNameLabel] == pool.Name {
-			logger.Debugf("machine pool already has lease: %s", l.Name)
+			a.logger.Debugf("machine pool already has lease: %s", l.Name)
 			// Ensure the lease name is in the format we expect, we know everything up to
 			// the last character.
 			leaseChar := l.Name[len(l.Name)-1:]
@@ -224,17 +249,17 @@ func (a *GCPActuator) obtainLease(pool *hivev1.MachinePool, cd *hivev1.ClusterDe
 		}
 	}
 
-	logger.Debugf("machine pool does not have a lease yet")
+	a.logger.Debugf("machine pool does not have a lease yet")
 
 	var leaseRune rune
-	// If the pool.Spec.Name == "worker", we want to preseve this MachinePool's "w" character that
+	// If the pool.Spec.Name == "worker", we want to preserve this MachinePool's "w" character that
 	// the installer would have selected so we do not cycle all worker nodes.
 	// Despite the separation of pool.Name and pool.Spec.Name, we do know that only one pool will
 	// have pool.Spec.Name worker as we validate that the pool must be named
 	// [clusterdeploymentname]-[pool.spec.name]
 	if pool.Spec.Name == "worker" {
 		leaseRune = 'w'
-		logger.Debug("selecting lease char 'w' for original worker pool")
+		a.logger.Debug("selecting lease char 'w' for original worker pool")
 	} else {
 		// Pool does not have a lease yet, lookup all currently available lease chars
 		availLeaseChars, err := a.findAvailableLeaseChars(cd, leases)
@@ -242,7 +267,7 @@ func (a *GCPActuator) obtainLease(pool *hivev1.MachinePool, cd *hivev1.ClusterDe
 			return "", false, err
 		}
 		if len(availLeaseChars) == 0 {
-			logger.Warn("no GCP MachinePoolNameLease characters available, setting condition")
+			a.logger.Warn("no GCP MachinePoolNameLease characters available, setting condition")
 			conds, changed := controllerutils.SetMachinePoolConditionWithChangeCheck(
 				pool.Status.Conditions,
 				hivev1.NoMachinePoolNameLeasesAvailable,
@@ -280,10 +305,10 @@ func (a *GCPActuator) obtainLease(pool *hivev1.MachinePool, cd *hivev1.ClusterDe
 		// Choose a random entry in the available chars to limit collisions while processing
 		// multiple machine pools at the same time. In this case the subsequent attempts to create
 		// the lease will fail due to name collisions and re-reconcile.
-		logger.Debug("selecting random lease char from available")
+		a.logger.Debug("selecting random lease char from available")
 		leaseRune = availLeaseChars[rand.Intn(len(availLeaseChars))]
 	}
-	logger.Debugf("selected lease char: %s", string(leaseRune))
+	a.logger.Debugf("selected lease char: %s", string(leaseRune))
 
 	leaseName := fmt.Sprintf("%s-%s", cd.Spec.ClusterMetadata.InfraID, string(leaseRune))
 	// Attempt to claim the lease:
@@ -306,15 +331,14 @@ func (a *GCPActuator) obtainLease(pool *hivev1.MachinePool, cd *hivev1.ClusterDe
 			},
 		},
 	}
-	logger.Debug("adding expectation for lease creation for this pool")
+	a.logger.Debug("adding expectation for lease creation for this pool")
 	expectKey := types.NamespacedName{Namespace: pool.Namespace, Name: pool.Name}.String()
 	a.expectations.ExpectCreations(expectKey, 1)
-	err = a.client.Create(context.TODO(), l)
-	if err != nil {
+	if err := a.client.Create(context.TODO(), l); err != nil {
 		a.expectations.DeleteExpectations(expectKey)
 		return "", false, err
 	}
-	logger.WithField("lease", leaseName).Infof("created lease, waiting until creation is observed")
+	a.logger.WithField("lease", leaseName).Infof("created lease, waiting until creation is observed")
 
 	return string(leaseRune), false, nil
 }
@@ -350,4 +374,69 @@ func (a *GCPActuator) findAvailableLeaseChars(cd *hivev1.ClusterDeployment, leas
 	}
 
 	return keys, nil
+}
+
+func requireLeases(clusterVersion string, remoteMachineSets []machineapi.MachineSet, logger log.FieldLogger) bool {
+	logger = logger.WithField("clusterVersion", clusterVersion)
+	if v, err := semver.ParseTolerant(clusterVersion); err == nil {
+		if !versionsSupportingFullNames(v) {
+			logger.Debug("leases are required since cluster does not support full machine names")
+			return true
+		}
+	}
+	poolNames := make(map[string]bool)
+	for _, ms := range remoteMachineSets {
+		nameParts := strings.Split(ms.Name, "-")
+		if len(nameParts) < 3 {
+			continue
+		}
+		poolName := nameParts[len(nameParts)-2]
+		poolNames[poolName] = true
+	}
+	// If there are machinesets with a pool name of "w" and no machinesets with a pool name of "worker", then assume
+	// that the "w" pool is the worker pool created by the installer. If the installer-created "w" worker pool still
+	// exists, then we must continue to use leases.
+	// This will cause problems if a machineset is created on the cluster with a "w" pool name that is not the
+	// installer-created worker pool when there are Hive-managed pools that are not using leases. Hive will block
+	// through validation MachinePools with a pool name of "w", but the user could still create such machinesets on
+	// the cluster manually.
+	if poolNames["w"] && !poolNames["worker"] {
+		logger.Debug("leases are required since there is a \"w\" machine pool in the cluster that is likely the installer-created worker pool")
+		return true
+	}
+	logger.Debug("leases are not required")
+	return false
+}
+
+// Get the image ID from an existing master machine.
+func getGCPImageID(masterMachine *machineapi.Machine, scheme *runtime.Scheme, logger log.FieldLogger) (string, error) {
+	providerSpec, err := decodeGCPMachineProviderSpec(masterMachine.Spec.ProviderSpec.Value, scheme)
+	if err != nil {
+		logger.WithError(err).Warn("cannot decode GCPMachineProviderSpec from master machine")
+		return "", errors.Wrap(err, "cannot decode GCPMachineProviderSpec from master machine")
+	}
+	if len(providerSpec.Disks) == 0 {
+		logger.Warn("master machine does not have any disks")
+		return "", errors.New("master machine does not have any disks")
+	}
+	imageID := providerSpec.Disks[0].Image
+	logger.WithField("image", imageID).Debug("resolved image to use for new machinesets")
+	return imageID, nil
+}
+
+func decodeGCPMachineProviderSpec(rawExt *runtime.RawExtension, scheme *runtime.Scheme) (*gcpproviderv1beta1.GCPMachineProviderSpec, error) {
+	codecFactory := serializer.NewCodecFactory(scheme)
+	decoder := codecFactory.UniversalDecoder(gcpproviderv1beta1.SchemeGroupVersion)
+	if rawExt == nil {
+		return nil, fmt.Errorf("MachineSet has no ProviderSpec")
+	}
+	obj, gvk, err := decoder.Decode([]byte(rawExt.Raw), nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("could not decode GCP ProviderSpec: %v", err)
+	}
+	spec, ok := obj.(*gcpproviderv1beta1.GCPMachineProviderSpec)
+	if !ok {
+		return nil, fmt.Errorf("Unexpected object: %#v", gvk)
+	}
+	return spec, nil
 }

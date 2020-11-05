@@ -10,7 +10,7 @@ import (
 )
 
 func (o *ClusterUninstaller) listInstanceGroups() ([]cloudResource, error) {
-	return o.listInstanceGroupsWithFilter("items/*/instanceGroups(name,zone),nextPageToken", o.clusterIDFilter(), nil)
+	return o.listInstanceGroupsWithFilter("items/*/instanceGroups(name,selfLink,zone),nextPageToken", o.clusterIDFilter(), nil)
 }
 
 // listInstanceGroupsWithFilter lists addresses in the project that satisfy the filter criteria.
@@ -37,6 +37,7 @@ func (o *ClusterUninstaller) listInstanceGroupsWithFilter(fields string, filter 
 						name:     item.Name,
 						typeName: "instancegroup",
 						zone:     zoneName,
+						url:      item.SelfLink,
 					})
 				}
 			}
@@ -45,33 +46,6 @@ func (o *ClusterUninstaller) listInstanceGroupsWithFilter(fields string, filter 
 	})
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to fetch compute instance groups")
-	}
-	return result, nil
-}
-
-func (o *ClusterUninstaller) listInstanceGroupInstances(ig cloudResource) ([]cloudResource, error) {
-	o.Logger.Debugf("Listing instance group instances for %v", ig)
-	ctx, cancel := o.contextWithTimeout()
-	defer cancel()
-	result := []cloudResource{}
-	req := o.computeSvc.InstanceGroups.ListInstances(o.ProjectID, ig.zone, ig.name, &compute.InstanceGroupsListInstancesRequest{}).Fields("items(instance),nextPageToken")
-	err := req.Pages(ctx, func(list *compute.InstanceGroupsListInstances) error {
-		for _, item := range list.Items {
-			name, zone := o.getInstanceNameAndZone(item.Instance)
-			if len(name) == 0 {
-				continue
-			}
-			result = append(result, cloudResource{
-				key:      fmt.Sprintf("%s/%s", zone, name),
-				name:     name,
-				typeName: "instance",
-				zone:     zone,
-			})
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to fetch instance group instances")
 	}
 	return result, nil
 }
@@ -105,13 +79,14 @@ func (o *ClusterUninstaller) destroyInstanceGroups() error {
 		return err
 	}
 	items := o.insertPendingItems("instancegroup", found)
-	errs := []error{}
 	for _, item := range items {
 		err := o.deleteInstanceGroup(item)
 		if err != nil {
-			errs = append(errs, err)
+			o.errorTracker.suppressWarning(item.key, err, o.Logger)
 		}
 	}
-	items = o.getPendingItems("instancegroup")
-	return aggregateError(errs, len(items))
+	if items = o.getPendingItems("instancegroup"); len(items) > 0 {
+		return errors.Errorf("%d items pending", len(items))
+	}
+	return nil
 }

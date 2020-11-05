@@ -10,63 +10,101 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
 	awsclient "github.com/openshift/hive/pkg/awsclient"
+	"github.com/openshift/hive/pkg/azureclient"
 	hivemetrics "github.com/openshift/hive/pkg/controller/metrics"
 	controllerutils "github.com/openshift/hive/pkg/controller/utils"
 	gcpclient "github.com/openshift/hive/pkg/gcpclient"
-
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/flowcontrol"
+	"k8s.io/client-go/util/workqueue"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 const (
-	controllerName                  = "dnszone"
+	ControllerName                  = hivev1.DNSZoneControllerName
 	zoneResyncDuration              = 2 * time.Hour
 	domainAvailabilityCheckInterval = 30 * time.Second
 	dnsClientTimeout                = 30 * time.Second
 	resolverConfigFile              = "/etc/resolv.conf"
 	zoneCheckDNSServersEnvVar       = "ZONE_CHECK_DNS_SERVERS"
+	accessDeniedReason              = "AccessDenied"
+	accessGrantedReason             = "AccessGranted"
+	authenticationFailedReason      = "AuthenticationFailed"
+	authenticationSucceededReason   = "AuthenticationSucceeded"
 )
+
+var (
+	metricDNSZonesDeleted = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "hive_dnszones_deleted_total",
+		Help: "Counter incremented every time we observe a deleted dnszone. Force will be true if we were unable to properly cleanup the zone.",
+	},
+		[]string{"force"},
+	)
+)
+
+func init() {
+	metrics.Registry.MustRegister(metricDNSZonesDeleted)
+}
 
 // Add creates a new DNSZone Controller and adds it to the Manager with default RBAC. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func Add(mgr manager.Manager) error {
-	return add(mgr, newReconciler(mgr))
+	logger := log.WithField("controller", ControllerName)
+	concurrentReconciles, clientRateLimiter, queueRateLimiter, err := controllerutils.GetControllerConfig(mgr.GetClient(), ControllerName)
+	if err != nil {
+		logger.WithError(err).Error("could not get controller configurations")
+		return err
+	}
+	return add(mgr, newReconciler(mgr, clientRateLimiter), concurrentReconciles, queueRateLimiter)
 }
 
 // newReconciler returns a new reconcile.Reconciler
-func newReconciler(mgr manager.Manager) reconcile.Reconciler {
+func newReconciler(mgr manager.Manager, rateLimiter flowcontrol.RateLimiter) *ReconcileDNSZone {
 	return &ReconcileDNSZone{
-		Client:    controllerutils.NewClientWithMetricsOrDie(mgr, controllerName),
+		Client:    controllerutils.NewClientWithMetricsOrDie(mgr, ControllerName, &rateLimiter),
 		scheme:    mgr.GetScheme(),
-		logger:    log.WithField("controller", controllerName),
+		logger:    log.WithField("controller", ControllerName),
 		soaLookup: lookupSOARecord,
 	}
 }
 
 // add adds a new Controller to mgr with r as the reconcile.Reconciler
-func add(mgr manager.Manager, r reconcile.Reconciler) error {
+func add(mgr manager.Manager, r *ReconcileDNSZone, concurrentReconciles int, rateLimiter workqueue.RateLimiter) error {
 	// Create a new controller
-	c, err := controller.New(controllerName, mgr, controller.Options{Reconciler: r, MaxConcurrentReconciles: controllerutils.GetConcurrentReconciles()})
+	c, err := controller.New(ControllerName.String(), mgr, controller.Options{
+		Reconciler:              r,
+		MaxConcurrentReconciles: concurrentReconciles,
+		RateLimiter:             rateLimiter,
+	})
 	if err != nil {
 		return err
 	}
 
 	// Watch for changes to DNSZone
-	err = c.Watch(&source.Kind{Type: &hivev1.DNSZone{}}, &handler.EnqueueRequestForObject{})
-	if err != nil {
+	if err := c.Watch(&source.Kind{Type: &hivev1.DNSZone{}}, &handler.EnqueueRequestForObject{}); err != nil {
+		return err
+	}
+
+	// Watch for changes to ClusterDeployment
+	if err := c.Watch(
+		&source.Kind{Type: &hivev1.ClusterDeployment{}},
+		controllerutils.EnqueueDNSZonesOwnedByClusterDeployment(r, r.logger),
+	); err != nil {
 		return err
 	}
 
@@ -89,20 +127,10 @@ type ReconcileDNSZone struct {
 // Reconcile reads that state of the cluster for a DNSZone object and makes changes based on the state read
 // and what is in the DNSZone.Spec
 func (r *ReconcileDNSZone) Reconcile(request reconcile.Request) (reconcile.Result, error) {
-	start := time.Now()
-	dnsLog := r.logger.WithFields(log.Fields{
-		"controller": controllerName,
-		"dnszone":    request.Name,
-		"namespace":  request.Namespace,
-	})
-
-	// For logging, we need to see when the reconciliation loop starts and ends.
+	dnsLog := controllerutils.BuildControllerLogger(ControllerName, "dnsZone", request.NamespacedName)
 	dnsLog.Info("reconciling dns zone")
-	defer func() {
-		dur := time.Since(start)
-		hivemetrics.MetricControllerReconcileTime.WithLabelValues(controllerName).Observe(dur.Seconds())
-		dnsLog.WithField("elapsed", dur).Info("reconcile complete")
-	}()
+	recobsrv := hivemetrics.NewReconcileObserver(ControllerName, dnsLog)
+	defer recobsrv.ObserveControllerReconcileTime()
 
 	// Fetch the DNSZone object
 	desiredState := &hivev1.DNSZone{}
@@ -116,6 +144,12 @@ func (r *ReconcileDNSZone) Reconcile(request reconcile.Request) (reconcile.Resul
 		// Error reading the object - requeue the request.
 		dnsLog.WithError(err).Error("Error fetching dnszone object")
 		return reconcile.Result{}, err
+	}
+
+	if result, err := controllerutils.ReconcileDNSZoneForRelocation(r.Client, dnsLog, desiredState, hivev1.FinalizerDNSZone); err != nil {
+		return reconcile.Result{}, err
+	} else if result != nil {
+		return *result, nil
 	}
 
 	// See if we need to sync. This is what rate limits our dns provider API usage, but allows for immediate syncing
@@ -153,6 +187,8 @@ func (r *ReconcileDNSZone) Reconcile(request reconcile.Request) (reconcile.Resul
 				err := r.Client.Update(context.TODO(), desiredState)
 				if err != nil {
 					dnsLog.WithError(err).Log(controllerutils.LogLevel(err), "Failed to remove DNSZone finalizer")
+				} else {
+					metricDNSZonesDeleted.WithLabelValues("true").Inc()
 				}
 
 				// This returns whether there was an error or not.
@@ -173,8 +209,15 @@ func (r *ReconcileDNSZone) Reconcile(request reconcile.Request) (reconcile.Resul
 		"lastSyncGeneration": desiredState.Status.LastSyncGeneration,
 	}).Info("Syncing DNS Zone")
 	result, err := r.reconcileDNSProvider(actuator, desiredState)
+	conditionsChanged := actuator.SetConditionsForError(err)
+
+	if conditionsChanged {
+		if err := r.Status().Update(context.Background(), desiredState); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
 	if err != nil {
-		dnsLog.WithError(err).Error("Encountered error while attempting to reconcile")
+		dnsLog.WithError(err).Log(controllerutils.LogLevel(err), "Encountered error while attempting to reconcile")
 	}
 	return result, err
 }
@@ -210,6 +253,7 @@ func (r *ReconcileDNSZone) reconcileDNSProvider(actuator Actuator, dnsZone *hive
 			if err != nil {
 				r.logger.WithError(err).Log(controllerutils.LogLevel(err), "Failed to remove DNSZone finalizer")
 			}
+			metricDNSZonesDeleted.WithLabelValues("false").Inc()
 		}
 		return reconcile.Result{}, err
 	}
@@ -253,14 +297,6 @@ func (r *ReconcileDNSZone) reconcileDNSProvider(actuator Actuator, dnsZone *hive
 	if !isZoneSOAAvailable {
 		r.logger.Info("SOA record for DNS zone not available")
 		reconcileResult.RequeueAfter = domainAvailabilityCheckInterval
-	}
-
-	r.logger.Debug("Letting the actuator modify the DNSZone status before sending it to kube.")
-	err = actuator.ModifyStatus()
-	if err != nil {
-		r.logger.WithError(err).Error("error modifying DNSZone status")
-		reconcileResult.RequeueAfter = domainAvailabilityCheckInterval
-		return reconcileResult, err
 	}
 
 	return reconcileResult, r.updateStatus(nameServers, isZoneSOAAvailable, dnsZone)
@@ -329,6 +365,21 @@ func (r *ReconcileDNSZone) getActuator(dnsZone *hivev1.DNSZone, dnsLog log.Field
 		}
 
 		return NewGCPActuator(dnsLog, secret, dnsZone, gcpclient.NewClientFromSecret)
+	}
+
+	if dnsZone.Spec.Azure != nil {
+		secret := &corev1.Secret{}
+		err := r.Get(context.TODO(),
+			types.NamespacedName{
+				Name:      dnsZone.Spec.Azure.CredentialsSecretRef.Name,
+				Namespace: dnsZone.Namespace,
+			},
+			secret)
+		if err != nil {
+			return nil, err
+		}
+
+		return NewAzureActuator(dnsLog, secret, dnsZone, azureclient.NewClientFromSecret)
 	}
 
 	return nil, errors.New("unable to determine which actuator to use")

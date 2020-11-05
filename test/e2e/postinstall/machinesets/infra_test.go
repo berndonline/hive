@@ -9,9 +9,10 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/mod/semver"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -26,6 +27,7 @@ import (
 	hivev1aws "github.com/openshift/hive/pkg/apis/hive/v1/aws"
 	hivev1azure "github.com/openshift/hive/pkg/apis/hive/v1/azure"
 	hivev1gcp "github.com/openshift/hive/pkg/apis/hive/v1/gcp"
+	"github.com/openshift/hive/pkg/constants"
 	"github.com/openshift/hive/test/e2e/common"
 )
 
@@ -298,12 +300,12 @@ func TestAutoscalingMachinePool(t *testing.T) {
 	// 1, the total CPU request from the deployment is 100. For AWS using m4.xlarge,
 	// each machine has a CPU limit of 4. For the max replicas of 12, the total
 	// CPU limit is 48.
-	busyboxDeployment := &extensionsv1beta1.Deployment{
+	busyboxDeployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: "default",
 			Name:      "busybox",
 		},
-		Spec: extensionsv1beta1.DeploymentSpec{
+		Spec: appsv1.DeploymentSpec{
 			Replicas: pointer.Int32Ptr(100),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
@@ -420,11 +422,19 @@ func waitForNodes(logger log.FieldLogger, cfg *rest.Config, cd *hivev1.ClusterDe
 }
 
 func machineNamePrefix(cd *hivev1.ClusterDeployment, poolName string) (string, error) {
-	switch p := cd.Spec.Platform; {
-	case p.GCP != nil:
-		return common.WaitForMachinePoolNameLease(common.MustGetConfig(), cd.Namespace,
-			fmt.Sprintf("%s-%s", cd.Name, poolName), 20*time.Second)
-	default:
-		return fmt.Sprintf("%s-%s-", cd.Spec.ClusterMetadata.InfraID, poolName), nil
+	// GCP clusters running an OpenShift version earlier than 4.4.8 require leases for machine pool names because the
+	// pool name is limited to a single character.
+	if p := cd.Spec.Platform; p.GCP != nil {
+		version, versionPresent := cd.Labels[constants.VersionMajorMinorPatchLabel]
+		if versionPresent && semver.Compare("v4.4.8", "v"+version) > 0 {
+			return common.WaitForMachinePoolNameLease(
+				common.MustGetConfig(),
+				cd.Namespace,
+				fmt.Sprintf("%s-%s", cd.Name, poolName),
+				20*time.Second,
+			)
+		}
 	}
+
+	return fmt.Sprintf("%s-%s-", cd.Spec.ClusterMetadata.InfraID, poolName), nil
 }

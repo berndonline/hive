@@ -13,15 +13,18 @@ import (
 	"github.com/Azure/azure-sdk-for-go/services/privatedns/mgmt/2018-09-01/privatedns"
 	"github.com/Azure/azure-sdk-for-go/services/resources/mgmt/2018-05-01/resources"
 	"github.com/Azure/go-autorest/autorest"
+	azureenv "github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
 
 	azuresession "github.com/openshift/installer/pkg/asset/installconfig/azure"
 	"github.com/openshift/installer/pkg/destroy/providers"
 	"github.com/openshift/installer/pkg/types"
+	"github.com/openshift/installer/pkg/types/azure"
 )
 
 // ClusterUninstaller holds the various options for the cluster we want to delete.
@@ -30,8 +33,10 @@ type ClusterUninstaller struct {
 	TenantID        string
 	GraphAuthorizer autorest.Authorizer
 	Authorizer      autorest.Authorizer
+	Environment     azureenv.Environment
 
-	InfraID string
+	InfraID           string
+	ResourceGroupName string
 
 	Logger logrus.FieldLogger
 
@@ -45,66 +50,150 @@ type ClusterUninstaller struct {
 }
 
 func (o *ClusterUninstaller) configureClients() {
-	o.resourceGroupsClient = resources.NewGroupsClient(o.SubscriptionID)
+	o.resourceGroupsClient = resources.NewGroupsClientWithBaseURI(o.Environment.ResourceManagerEndpoint, o.SubscriptionID)
 	o.resourceGroupsClient.Authorizer = o.Authorizer
 
-	o.zonesClient = dns.NewZonesClient(o.SubscriptionID)
+	o.zonesClient = dns.NewZonesClientWithBaseURI(o.Environment.ResourceManagerEndpoint, o.SubscriptionID)
 	o.zonesClient.Authorizer = o.Authorizer
 
-	o.recordsClient = dns.NewRecordSetsClient(o.SubscriptionID)
+	o.recordsClient = dns.NewRecordSetsClientWithBaseURI(o.Environment.ResourceManagerEndpoint, o.SubscriptionID)
 	o.recordsClient.Authorizer = o.Authorizer
 
-	o.privateZonesClient = privatedns.NewPrivateZonesClient(o.SubscriptionID)
+	o.privateZonesClient = privatedns.NewPrivateZonesClientWithBaseURI(o.Environment.ResourceManagerEndpoint, o.SubscriptionID)
 	o.privateZonesClient.Authorizer = o.Authorizer
 
-	o.privateRecordSetsClient = privatedns.NewRecordSetsClient(o.SubscriptionID)
+	o.privateRecordSetsClient = privatedns.NewRecordSetsClientWithBaseURI(o.Environment.ResourceManagerEndpoint, o.SubscriptionID)
 	o.privateRecordSetsClient.Authorizer = o.Authorizer
 
-	o.serviceprincipalsClient = graphrbac.NewServicePrincipalsClient(o.TenantID)
+	o.serviceprincipalsClient = graphrbac.NewServicePrincipalsClientWithBaseURI(o.Environment.GraphEndpoint, o.TenantID)
 	o.serviceprincipalsClient.Authorizer = o.GraphAuthorizer
 
-	o.applicationsClient = graphrbac.NewApplicationsClient(o.TenantID)
+	o.applicationsClient = graphrbac.NewApplicationsClientWithBaseURI(o.Environment.GraphEndpoint, o.TenantID)
 	o.applicationsClient.Authorizer = o.GraphAuthorizer
 }
 
 // New returns an Azure destroyer from ClusterMetadata.
 func New(logger logrus.FieldLogger, metadata *types.ClusterMetadata) (providers.Destroyer, error) {
-	session, err := azuresession.GetSession()
+	cloudName := metadata.Azure.CloudName
+	if cloudName == "" {
+		cloudName = azure.PublicCloud
+	}
+	session, err := azuresession.GetSession(cloudName)
 	if err != nil {
 		return nil, err
 	}
 
+	group := metadata.Azure.ResourceGroupName
+	if len(group) == 0 {
+		group = metadata.InfraID + "-rg"
+	}
+
 	return &ClusterUninstaller{
-		SubscriptionID:  session.Credentials.SubscriptionID,
-		TenantID:        session.Credentials.TenantID,
-		GraphAuthorizer: session.GraphAuthorizer,
-		Authorizer:      session.Authorizer,
-		InfraID:         metadata.InfraID,
-		Logger:          logger,
+		SubscriptionID:    session.Credentials.SubscriptionID,
+		TenantID:          session.Credentials.TenantID,
+		GraphAuthorizer:   session.GraphAuthorizer,
+		Authorizer:        session.Authorizer,
+		Environment:       session.Environment,
+		InfraID:           metadata.InfraID,
+		ResourceGroupName: group,
+		Logger:            logger,
 	}, nil
 }
 
 // Run is the entrypoint to start the uninstall process.
 func (o *ClusterUninstaller) Run() error {
+	var errs []error
+	var err error
+
 	o.configureClients()
-	group := o.InfraID + "-rg"
-	o.Logger.Debug("deleting public records")
-	if err := deletePublicRecords(context.TODO(), o.zonesClient, o.recordsClient, o.privateZonesClient, o.privateRecordSetsClient, o.Logger, group); err != nil {
+
+	// 2 hours
+	timeout := 120 * time.Minute
+	waitCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	wait.UntilWithContext(
+		waitCtx,
+		func(ctx context.Context) {
+			o.Logger.Debugf("deleting public records")
+			err = deletePublicRecords(ctx, o.zonesClient, o.recordsClient, o.privateZonesClient, o.privateRecordSetsClient, o.Logger, o.ResourceGroupName)
+			if err != nil {
+				o.Logger.Debug(err)
+				if isAuthError(err) {
+					cancel()
+					errs = append(errs, errors.Wrap(err, "unable to authenticate when deleting public DNS records"))
+				}
+				return
+			}
+			cancel()
+		},
+		1*time.Second,
+	)
+	err = waitCtx.Err()
+	if err != nil && err != context.Canceled {
+		errs = append(errs, errors.Wrap(err, "failed to delete public DNS records"))
 		o.Logger.Debug(err)
-		return errors.Wrap(err, "failed to delete public DNS records")
-	}
-	o.Logger.Debug("deleting resource group")
-	if err := deleteResourceGroup(context.TODO(), o.resourceGroupsClient, o.Logger, group); err != nil {
-		o.Logger.Debug(err)
-		return errors.Wrap(err, "failed to delete resource group")
-	}
-	o.Logger.Debug("deleting application registrations")
-	if err := deleteApplicationRegistrations(context.TODO(), o.applicationsClient, o.serviceprincipalsClient, o.Logger, o.InfraID); err != nil {
-		o.Logger.Debug(err)
-		return errors.Wrap(err, "failed to delete application registrations and their service principals")
 	}
 
-	return nil
+	deadline, _ := waitCtx.Deadline()
+	diff := time.Until(deadline)
+	if diff > 0 {
+		waitCtx, cancel = context.WithTimeout(context.Background(), diff)
+	}
+
+	wait.UntilWithContext(
+		waitCtx,
+		func(ctx context.Context) {
+			o.Logger.Debugf("deleting resource group")
+			err = deleteResourceGroup(ctx, o.resourceGroupsClient, o.Logger, o.ResourceGroupName)
+			if err != nil {
+				o.Logger.Debug(err)
+				if isAuthError(err) {
+					cancel()
+					errs = append(errs, errors.Wrap(err, "unable to authenticate when deleting resource group"))
+				}
+				return
+			}
+			cancel()
+		},
+		1*time.Second,
+	)
+	err = waitCtx.Err()
+	if err != nil && err != context.Canceled {
+		errs = append(errs, errors.Wrap(err, "failed to delete resource group"))
+		o.Logger.Debug(err)
+	}
+
+	deadline, _ = waitCtx.Deadline()
+	diff = time.Until(deadline)
+	if diff > 0 {
+		waitCtx, cancel = context.WithTimeout(context.Background(), diff)
+	}
+
+	wait.UntilWithContext(
+		waitCtx,
+		func(ctx context.Context) {
+			o.Logger.Debugf("deleting application registrations")
+			err = deleteApplicationRegistrations(ctx, o.applicationsClient, o.serviceprincipalsClient, o.Logger, o.InfraID)
+			if err != nil {
+				o.Logger.Debug(err)
+				if isAuthError(err) {
+					cancel()
+					errs = append(errs, errors.Wrap(err, "unable to authenticate when deleting application registrations and their service principals"))
+				}
+				return
+			}
+			cancel()
+		},
+		1*time.Second,
+	)
+	err = waitCtx.Err()
+	if err != nil && err != context.Canceled {
+		errs = append(errs, errors.Wrap(err, "failed to delete application registrations and their service principals"))
+		o.Logger.Debug(err)
+	}
+
+	return utilerrors.NewAggregate(errs)
 }
 
 func deletePublicRecords(ctx context.Context, dnsClient dns.ZonesClient, recordsClient dns.RecordSetsClient, privateDNSClient privatedns.PrivateZonesClient, privateRecordsClient privatedns.RecordSetsClient, logger logrus.FieldLogger, rgName string) error {
@@ -113,32 +202,67 @@ func deletePublicRecords(ctx context.Context, dnsClient dns.ZonesClient, records
 
 	// collect records from private zones in rgName
 	var errs []error
-	for zonesPage, err := dnsClient.ListByResourceGroup(ctx, rgName, to.Int32Ptr(100)); zonesPage.NotDone(); err = zonesPage.NextWithContext(ctx) {
+
+	zonesPage, err := dnsClient.ListByResourceGroup(ctx, rgName, to.Int32Ptr(100))
+	if err != nil {
+		if zonesPage.Response().IsHTTPStatus(http.StatusNotFound) {
+			logger.Debug("already deleted")
+			return utilerrors.NewAggregate(errs)
+		}
+		errs = append(errs, errors.Wrap(err, "failed to list dns zone"))
+		if isAuthError(err) {
+			return err
+		}
+	}
+
+	for ; zonesPage.NotDone(); err = zonesPage.NextWithContext(ctx) {
 		if err != nil {
-			errs = append(errs, errors.Wrap(err, "failed to list dns zone"))
+			errs = append(errs, errors.Wrap(err, "failed to advance to next dns zone"))
 			continue
 		}
+
 		for _, zone := range zonesPage.Values() {
 			if zone.ZoneType == dns.Private {
 				if err := deletePublicRecordsForZone(ctx, dnsClient, recordsClient, logger, rgName, to.String(zone.Name)); err != nil {
 					errs = append(errs, errors.Wrapf(err, "failed to delete public records for %s", to.String(zone.Name)))
+					if isAuthError(err) {
+						return err
+					}
 					continue
 				}
 			}
 		}
 	}
-	for zonesPage, err := privateDNSClient.ListByResourceGroup(ctx, rgName, to.Int32Ptr(100)); zonesPage.NotDone(); err = zonesPage.NextWithContext(ctx) {
+
+	privateZonesPage, err := privateDNSClient.ListByResourceGroup(ctx, rgName, to.Int32Ptr(100))
+	if err != nil {
+		if privateZonesPage.Response().IsHTTPStatus(http.StatusNotFound) {
+			logger.Debug("already deleted")
+			return utilerrors.NewAggregate(errs)
+		}
+		errs = append(errs, errors.Wrap(err, "failed to list private dns zone"))
+		if isAuthError(err) {
+			return err
+		}
+	}
+
+	for ; privateZonesPage.NotDone(); err = privateZonesPage.NextWithContext(ctx) {
 		if err != nil {
-			errs = append(errs, errors.Wrap(err, "failed to list private dns zone"))
+			errs = append(errs, errors.Wrap(err, "failed to advance to next dns zone"))
 			continue
 		}
-		for _, zone := range zonesPage.Values() {
+
+		for _, zone := range privateZonesPage.Values() {
 			if err := deletePublicRecordsForPrivateZone(ctx, privateRecordsClient, dnsClient, recordsClient, logger, rgName, to.String(zone.Name)); err != nil {
 				errs = append(errs, errors.Wrapf(err, "failed to delete public records for %s", to.String(zone.Name)))
+				if isAuthError(err) {
+					return err
+				}
 				continue
 			}
 		}
 	}
+
 	return utilerrors.NewAggregate(errs)
 }
 
@@ -260,6 +384,10 @@ func deleteResourceGroup(ctx context.Context, client resources.GroupsClient, log
 
 	delFuture, err := client.Delete(ctx, name)
 	if err != nil {
+		if wasNotFound(delFuture.Response()) {
+			logger.Debug("already deleted")
+			return nil
+		}
 		return err
 	}
 
@@ -279,12 +407,33 @@ func wasNotFound(resp *http.Response) bool {
 	return resp != nil && resp.StatusCode == http.StatusNotFound
 }
 
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var dErr autorest.DetailedError
+	if errors.As(err, &dErr) {
+		switch statusCode := dErr.StatusCode.(type) {
+		case int:
+			if statusCode >= 400 && statusCode <= 403 {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 func deleteApplicationRegistrations(ctx context.Context, appClient graphrbac.ApplicationsClient, spClient graphrbac.ServicePrincipalsClient, logger logrus.FieldLogger, infraID string) error {
 	errorList := []error{}
 
 	tag := fmt.Sprintf("kubernetes.io_cluster.%s=owned", infraID)
 	servicePrincipals, err := getServicePrincipalsByTag(ctx, spClient, tag, infraID)
 	if err != nil {
+		if isAuthError(err) {
+			return err
+		}
 		return errors.Wrap(err, "failed to gather list of Service Principals by tag")
 	}
 
@@ -293,6 +442,9 @@ func deleteApplicationRegistrations(ctx context.Context, appClient graphrbac.App
 		appFilter := fmt.Sprintf("appId eq '%s'", *sp.AppID)
 		appResults, err := appClient.List(ctx, appFilter)
 		if err != nil {
+			if isAuthError(err) {
+				return err
+			}
 			errorList = append(errorList, err)
 			continue
 		}
@@ -306,6 +458,9 @@ func deleteApplicationRegistrations(ctx context.Context, appClient graphrbac.App
 
 		_, err = appClient.Delete(ctx, *apps[0].ObjectID)
 		if err != nil {
+			if isAuthError(err) {
+				return err
+			}
 			errorList = append(errorList, err)
 			continue
 		}

@@ -8,9 +8,21 @@ Hive comes with an optional `hiveutil` binary to assist creating the `ClusterDep
 
 ### DNS
 
-OpenShift installation requires a live and functioning DNS zone in the cloud account into which you will be installing the new cluster(s). For example if you own example.com, you could create a hive.example.com subdomain in Route53, and ensure that you have made the appropriate NS entries under example.com to delegate to the Route53 zone. When creating a new cluster, the installer will make future DNS entries under hive.example.com as needed for the cluster(s).
+### Native
+
+For clouds where there is support for automated IP allocation and DNS configuration, (AWS, Azure, and GCP) an OpenShift installation requires a live and functioning DNS zone in the cloud account into which you will be installing the new cluster(s). For example if you own example.com, you could create a hive.example.com subdomain in Route53, and ensure that you have made the appropriate NS entries under example.com to delegate to the Route53 zone. When creating a new cluster, the installer will make future DNS entries under hive.example.com as needed for the cluster(s).
+
+#### Managed DNS
 
 In addition to the default OpenShift DNS support, Hive offers a DNS feature called Managed DNS. With Managed DNS, Hive can automatically create delegated zones for approved base domains. For example, if hive.example.com exists and is specified as your managed domain, you can specify a base domain of cluster1.hive.example.com on your `ClusterDeployment`, and Hive will create this zone for you, add forwarding records in the base domain, wait for it to resolve, and then proceed with installation.
+
+### Non-native
+
+For other platforms/clouds (OpenStack, oVirt, and VSphere), there is presently no native DNS auto-configuration available. This requires some up-front DNS configuration before a cluster can be installed.  It will typically be necessary to reserve virtual IPs (VIPs) that will be used for the cluster's management (eg `api.mycluster.hive.example.com`) and for the cluster's default ingress routes (eg `\*.apps.mycluster.hive.example.com`). Each platform/cloud's configuration will have its own system for alocating or reserving these IPs. Once the IPs are reserved, DNS entries must be published as A records (or simply making local host entries to manage the DNS-to-IP translations on the host(s) running Hive) so that the cluster's API endpoint will be accessible to Hive.
+
+#### oVirt
+
+In addition to reserving IPs for the API and ingress for the cluster, installing pre-4.6 versions of OpenShift onto oVirt requires providing an additional DNS IP for the internal DNS server operated by the cluster. This value must be populated into the Secret containing the `install-config.yaml` information.
 
 ### Pull Secret
 
@@ -75,7 +87,7 @@ kind: ClusterImageSet
 metadata:
   name: openshift-v4.3.0
 spec:
-  releaseImage: quay.io/openshift-release-dev/ocp-release:4.3.0
+  releaseImage: quay.io/openshift-release-dev/ocp-release:4.3.0-x86_64
 ```
 
 ### Cloud credentials
@@ -84,8 +96,12 @@ Hive requires credentials to the cloud account into which it will install OpenSh
 
 #### AWS
 
-Create a `secret` containing your AWS access key and secret access key:
+Create a `secret` containing your AWS access key and secret access key:  
 
+```bash
+oc create secret generic <mycluster>-aws-creds -n hive --from-literal=aws_access_key_id=<AWS_ACCESS_KEY_ID> --from-literal=aws_secret_access_key=<AWS_SECRET_ACCESS_KEY>
+```
+Take care when using the yaml below, you need to use base64 to encode the data values.
 ```yaml
 apiVersion: v1
 data:
@@ -124,6 +140,55 @@ data:
 kind: Secret
 metadata:
   name: mycluster-gcp-creds
+  namespace: mynamespace
+type: Opaque
+```
+
+#### oVirt
+Create a `secret` containing your oVirt credentials information:
+
+```yaml
+apiVersion: v1
+stringData:
+  ovirt_url: https://ovirt.example.com/ovirt-engine/api
+  ovirt_username: admin@internal
+  ovirt_password: secretpassword
+  ovirt_ca_bundle: |-
+    -----BEGIN CERTIFICATE-----
+    CA BUNDLE DATA HERE
+    -----END CERTIFICATE-----
+kind: Secret
+metadata:
+  name: mycluster-ovirt-creds
+  namespace: mynamespace
+type: Opaque
+```
+
+#### vSphere
+Create a `secret` containing your vSphere credentials information:
+
+```yaml
+apiVersion: v1
+stringData:
+  password: vsphereuser
+  username: secretpassword
+kind: Secret
+metadata:
+  name: mycluster-vsphere-creds
+  namespace: mynamespace
+type: Opaque
+```
+#### OpenStack
+
+Create a `secret` containing your OpenStack clouds.yaml file:
+
+```yaml
+apiVersion: v1
+data:
+  clouds.yaml: REDACTED
+kind: Secret
+metadata:
+  name: mycluster-openstack-creds
   namespace: mynamespace
 type: Opaque
 ```
@@ -224,6 +289,69 @@ and replace the contents of `platform` with:
     region: us-east1
 ```
 
+For oVirt, ensure the `compute` and `controlPlane` fields are empty.
+```yaml
+controlPlane:
+compute:
+```
+
+and populate the top-level `platform` fields with the appropriate information:
+```yaml
+platform:
+  ovirt:
+    api_vip: 192.168.1.10
+    dns_vip: 192.168.1.11  # only need dns_vip for pre-4.6 clusters
+    ingress_vip: 192.168.1.12
+    ovirt_cluster_id: 00000000-ovirt-uuid
+    ovirt_network_name: ovirt-network-name
+    ovirt_storage_domain_id: 00000000-storage-domain-uuid
+```
+
+For vSphere, ensure the `compute` and `controlPlane` fields are empty.
+```yaml
+controlPlane:
+compute:
+```
+
+and populate the top-level `platform` fields with the appropriate information:
+```yaml
+platform:
+  vsphere:
+    apiVIP: 192.168.1.10
+    cluster: devel
+    datacenter: dc1
+    defaultDatastore: ds1
+    folder: /dc1/vm/CLUSTER_NAME
+    ingressVIP: 192.168.1.11
+    network: "VM Network"
+    password: secretpassword
+    username: vsphereuser
+    vCenter: vcenter.example.com
+```
+
+For Openstack, replace the contents of `compute.platform` with:
+```yaml
+  openstack:
+    type: m1.large
+```
+Note: Use an instance type that meets the minimum requirement for the version of OpenShift being installed.
+
+and replace the contents of `controlPlane.platform` with:
+```yaml
+  openstack:
+    type: ci.m4.xlarge
+```
+Note: Use an instance type that meets the minimum requirement for the version of OpenShift being installed.
+
+and replace the contents of `platform` with:
+```yaml
+  openstack:
+    cloud: mycloud
+    computeFlavor: m1.large
+    externalNetwork: openstack_network_name
+    lbFloatingIP: 10.0.111.158
+```
+
 ### ClusterDeployment
 
 Cluster provisioning begins when a `ClusterDeployment` is created.
@@ -276,6 +404,46 @@ gcp:
   region: us-east1
 ```
 
+For oVirt, replace the contents of `spec.platform` with:
+```yaml
+ovirt:
+  certificatesSecretRef:
+    name: mycluster-ovirt-certs
+  credentialsSecretRef:
+    name: mycluster-ovirt-creds
+  ovirt_cluster_id: 00000000-ovirt-uuid
+  ovirt_network_name: ovirt-network-name
+  storage_domain_id: 00000000-storage-domain-uuid
+```
+
+And create a Secret that holds the CA certificate data for the oVirt environment:
+```bash
+oc create secret generic mycluster-ovirt-certs -n mynamespace --from-file=.cacert=$OVIRT_CA_CERT_FILENAME
+```
+
+For vSphere, replace the contents of `spec.platform` with:
+```yaml
+vsphere:                                                                    
+  certificatesSecretRef:         
+    name: mycluster-vsphere-certs
+  cluster: devel
+  credentialsSecretRef:                                                     
+    name: mycluster-vsphere-creds
+  datacenter: dc1
+  defaultDatastore: ds1     
+  folder: /dc1/vm/CLUSTER_NAME
+  network: "VM Network"
+  vCenter: vsphere.example.com
+```
+
+For OpenStack, replace the contents of `spec.platform` with:
+```yaml
+openstack:
+  cloud: mycloud
+  credentialsSecretRef:
+    name: mycluster-openstack-creds
+```
+
 ### Machine Pools
 
 To manage `MachinePools` Day 2, you need to define these as well. The definition of the worker pool should mostly match what was specified in `InstallConfig` to prevent replacement of all worker nodes.
@@ -319,6 +487,36 @@ gcp:
 ```
 
 WARNING: Due to some naming restrictions on various components in GCP, Hive will restrict you to a max of 35 MachinePools (including the original worker pool created by default). We are left with only a single character to differentiate the machines and nodes from a pool, and 'm' is already reserved for the master hosts, leaving us with a-z (minus m) and 0-9 for a total of 35. Hive will automatically create a MachinePoolNameLease for GCP MachinePools to grab one of the available characters until none are left, at which point your MachinePool will not be provisioned.
+
+For oVirt, replace the contents of `spec.platform` with the settings you want for the instances:
+```yaml
+ovirt:
+  cpu:
+    cores: 2
+    sockets: 1
+  memoryMB: 8174
+  osDisk:
+    sizeGB: 120
+```
+
+For vSphere, replace the contents of `spec.platform` with the settings you want for the instances:
+```yaml
+vsphere:
+  coresPerSocket: 1
+  cpus: 2
+  memoryMB: 8192
+  osDisk:
+    diskSizeGB: 120
+```
+
+For OpenStack, replace the contents of `spec.platform` with the settings you want for the instances:
+```yaml
+openstack:
+  rootVolume:
+    size: 10
+    type: ceph
+  flavor: m1.large
+```
 
 #### Create Cluster on Bare Metal
 
@@ -396,7 +594,7 @@ spec:
   controlPlaneConfig:
     servingCertificates: {}
   platform:
-    bareMetal:
+    baremetal:
       libvirtSSHPrivateKeySecretRef:
         name: provisioning-host-ssh-private-key
   provisioning:
@@ -520,7 +718,7 @@ To use this feature:
            domains:
            - hive.example.com
 
-  1. Specify which domains Hive is allowed to manage by adding them to the `.spec.managedDomains[].domains` list. When specifying `managedDNS: true` in a ClusterDeployment, the ClusterDeployment's baseDomain must be a direct child of one of these domains, otherwise the ClusterDeployment creation will result in a validation error. The baseDomain must also be unique to that cluster and must not be used in any other ClusterDeployment, including on separate Hive instances.
+  1. Specify which domains Hive is allowed to manage by adding them to the `.spec.managedDomains[].domains` list. When specifying `manageDNS: true` in a ClusterDeployment, the ClusterDeployment's baseDomain must be a direct child of one of these domains, otherwise the ClusterDeployment creation will result in a validation error. The baseDomain must also be unique to that cluster and must not be used in any other ClusterDeployment, including on separate Hive instances.
 
      As such, a domain may exist in the `.spec.managedDomains[].domains` list in multiple Hive instances. Note that the specified credentials must be valid to add and remove NS record entries for all domains listed in `.spec.managedDomains[].domains`.
 

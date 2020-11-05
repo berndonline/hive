@@ -11,6 +11,9 @@ const (
 	// VeleroBackupEnvVar is the name of the environment variable used to tell the controller manager to enable velero backup integration.
 	VeleroBackupEnvVar = "HIVE_VELERO_BACKUP"
 
+	// VeleroNamespaceEnvVar is the name of the environment variable used to tell the controller manager which namespace velero backup objects should be created in.
+	VeleroNamespaceEnvVar = "HIVE_VELERO_NAMESPACE"
+
 	// DeprovisionsDisabledEnvVar is the name of the environment variable used to tell the controller manager to skip
 	// processing of any ClusterDeprovisions.
 	DeprovisionsDisabledEnvVar = "DEPROVISIONS_DISABLED"
@@ -42,6 +45,11 @@ const (
 
 	// ClusterProvisionNameLabel is the label that is used to identify a relationship to a given cluster provision object.
 	ClusterProvisionNameLabel = "hive.openshift.io/cluster-provision-name"
+
+	// ClusterPoolNameLabel is the label that is used to signal that a namespace was created to house a
+	// ClusterDeployment created for a ClusterPool. The label is used to reap namespaces after the ClusterDeployment
+	// has been deleted.
+	ClusterPoolNameLabel = "hive.openshift.io/cluster-pool-name"
 
 	// SyncSetNameLabel is the label that is used to identify a relationship to a given syncset object.
 	SyncSetNameLabel = "hive.openshift.io/syncset-name"
@@ -100,14 +108,23 @@ const (
 	// GlobalPullSecret is the environment variable for controllers to get the global pull secret
 	GlobalPullSecret = "GLOBAL_PULL_SECRET"
 
-	// HiveNamespace is the name of Hive operator namespace
-	HiveNamespace = "hive"
+	// DefaultHiveNamespace is the default namespace where core hive components will run. It is used if the environment variable is not defined.
+	DefaultHiveNamespace = "hive"
+
+	// HiveNamespaceEnvVar is the environment variable for the namespace where the core hive-controllers and hiveadmission will run.
+	// This is set on the deployments by the hive-operator which deploys them, based on the targetNamespace defined in HiveConfig.
+	// The default is defined above.
+	HiveNamespaceEnvVar = "HIVE_NS"
 
 	// CheckpointName is the name of the object in each namespace in which the namespace's backup information is stored.
 	CheckpointName = "hive"
 
 	// SyncsetPauseAnnotation is a annotation used by clusterDeployment, if it's true, then we will disable syncing to a specific cluster
 	SyncsetPauseAnnotation = "hive.openshift.io/syncset-pause"
+
+	// HiveManagedLabel is a label added to any resources we sync to the remote cluster to help identify that they are
+	// managed by Hive, and any manual changes may be undone the next time the resource is reconciled.
+	HiveManagedLabel = "hive.openshift.io/managed"
 
 	// DisableInstallLogPasswordRedactionAnnotation is an annotation used on ClusterDeployments to disable the installmanager
 	// functionality which refuses to print output if it appears to contain a password or sensitive info. This can be
@@ -118,6 +135,28 @@ const (
 	// failure for the specified duration. This will keep the install pod running and allow a user to rsh in for debug
 	// purposes. Examples: "1h", "20m".
 	PauseOnInstallFailureAnnotation = "hive.openshift.io/pause-on-install-failure"
+
+	// WaitForInstallCompleteExecutionsAnnotation is an annotation used on ClusterDeployments to set additional waits
+	// for the cluster provision to complete by running `openshift-install wait-for install-complete` command.
+	WaitForInstallCompleteExecutionsAnnotation = "hive.openshift.io/wait-for-install-complete-executions"
+
+	// ProtectedDeleteAnnotation is an annotation used on ClusterDeployments to indicate that the ClusterDeployment
+	// cannot be deleted. The annotation must be removed in order to delete the ClusterDeployment.
+	ProtectedDeleteAnnotation = "hive.openshift.io/protected-delete"
+
+	// ProtectedDeleteEnvVar is the name of the environment variable used to tell the controller manager whether
+	// protected delete is enabled.
+	ProtectedDeleteEnvVar = "PROTECTED_DELETE"
+
+	// RelocateAnnotation is an annotation used on ClusterDeployments and DNSZones to indicate that the resource
+	// is involved in a relocation between Hive instances.
+	// The value of the annotation has the format "{ClusterRelocate}/{Status}", where
+	// {ClusterRelocate} is the name of the ClusterRelocate that is driving the relocation and
+	// {Status} is the status of the relocate. The status is outgoing, completed, or incoming.
+	// An outgoing status indicates that the resource is on the source side of an in-progress relocate.
+	// A completed status indicates that the resource is on the source side of a completed relocate.
+	// An incoming status indicates that the resource is on the destination side of an in-progress relocate.
+	RelocateAnnotation = "hive.openshift.io/relocate"
 
 	// ManagedDomainsFileEnvVar if present, points to a simple text
 	// file that includes a valid managed domain per line. Cluster deployments
@@ -134,6 +173,13 @@ const (
 
 	// AzureCredentialsName is the name of the Azure credentials file or secret key.
 	AzureCredentialsName = "osServicePrincipal.json"
+
+	// AzureCredentialsEnvVar is the name of the environment variable pointing to the location
+	// where Azure credentials can be found.
+	AzureCredentialsEnvVar = "AZURE_AUTH_LOCATION"
+
+	// OpenStackCredentialsName is the name of the OpenStack credentials file.
+	OpenStackCredentialsName = "clouds.yaml"
 
 	// SSHPrivKeyPathEnvVar is the environment variable Hive will set for the installmanager pod to point to the
 	// path where we mount in the SSH key to be configured on the cluster hosts.
@@ -169,6 +215,88 @@ const (
 
 	// AWSChinaRegionPrefix is the prefix for regions in AWS China.
 	AWSChinaRegionPrefix = "cn-"
+
+	// SSHPrivateKeySecretKey is the key we use in a Kubernetes Secret containing an SSH private key.
+	SSHPrivateKeySecretKey = "ssh-privatekey"
+
+	// RawKubeconfigSecretKey is the key we use in a Kubernetes Secret containing the raw (unmodified) form of
+	// an admin kubeconfig. (before Hive injects things such as additional CAs)
+	RawKubeconfigSecretKey = "raw-kubeconfig"
+
+	// AWSAccessKeyIDSecretKey is the key we use in a Kubernetes Secret containing AWS credentials for the access key ID.
+	AWSAccessKeyIDSecretKey = "aws_access_key_id"
+
+	// AWSSecretAccessKeySecretKey is the key we use in a Kubernetes Secret containing AWS credentials for the access key ID.
+	AWSSecretAccessKeySecretKey = "aws_secret_access_key"
+
+	// TLSCrtSecretKey is the key we use in a Kubernetes Secret containing a TLS certificate.
+	TLSCrtSecretKey = "tls.crt"
+
+	// TLSKeySecretKey is the key we use in a Kubernetes Secret containing a TLS certificate key.
+	TLSKeySecretKey = "tls.key"
+
+	// VSphereUsernameEnvVar is the environent variable specifying the vSphere username.
+	VSphereUsernameEnvVar = "GOVC_USERNAME"
+
+	// VSpherePasswordEnvVar is the environment variable specifying the vSphere password.
+	VSpherePasswordEnvVar = "GOVC_PASSWORD"
+
+	// VSphereVCenterEnvVar is the environment variable specifying the vSphere vCenter host.
+	VSphereVCenterEnvVar = "GOVC_HOST"
+
+	// VSphereTLSCACertsEnvVar is the environment variable containing : delimited paths to vSphere CA certificates.
+	VSphereTLSCACertsEnvVar = "GOVC_TLS_CA_CERTS"
+
+	// VSphereNetworkEnvVar is the environment variable specifying the vSphere network.
+	VSphereNetworkEnvVar = "GOVC_NETWORK"
+
+	// VSphereDataCenterEnvVar is the environment variable specifying the vSphere datacenter.
+	VSphereDataCenterEnvVar = "GOVC_DATACENTER"
+
+	// VSphereDataStoreEnvVar is the environment variable specifying the vSphere default datastore.
+	VSphereDataStoreEnvVar = "GOVC_DATASTORE"
+
+	// VersionMajorLabel is a label applied to ClusterDeployments to show the version of the cluster
+	// in the form "[MAJOR]".
+	VersionMajorLabel = "hive.openshift.io/version-major"
+
+	// VersionMajorMinorLabel is a label applied to ClusterDeployments to show the version of the cluster
+	// in the form "[MAJOR].[MINOR]".
+	VersionMajorMinorLabel = "hive.openshift.io/version-major-minor"
+
+	// VersionMajorMinorPatchLabel is a label applied to ClusterDeployments to show the version of the cluster
+	// in the form "[MAJOR].[MINOR].[PATCH]".
+	VersionMajorMinorPatchLabel = "hive.openshift.io/version-major-minor-patch"
+	// OvirtCredentialsName is the name of the oVirt credentials file.
+	OvirtCredentialsName = "ovirt-config.yaml"
+
+	// OvirtConfigEnvVar is the environment variable specifying the oVirt config path
+	OvirtConfigEnvVar = "OVIRT_CONFIG"
+
+	// AWSCredsMount is the location where the AWS credentials secret is mounted for uninstall pods.
+	AWSCredsMount = "/etc/aws-creds"
+
+	// InstallLogsUploadProviderEnvVar is used to specify which object store provider is being used.
+	InstallLogsUploadProviderEnvVar = "HIVE_INSTALL_LOGS_UPLOAD_PROVIDER"
+
+	// InstallLogsCredentialsSecretRefEnvVar is the environment variable specifying what secret to use for storing logs.
+	InstallLogsCredentialsSecretRefEnvVar = "HIVE_INSTALL_LOGS_CREDENTIALS_SECRET"
+
+	// InstallLogsUploadProviderAWS is used to specify that AWS is the cloud provider to upload logs to.
+	InstallLogsUploadProviderAWS = "aws"
+
+	// InstallLogsAWSRegionEnvVar is the environment variable specifying the region to use with S3
+	InstallLogsAWSRegionEnvVar = "HIVE_INSTALL_LOGS_AWS_REGION"
+
+	// InstallLogsAWSServiceEndpointEnvVar is the environment variable specifying the S3 endpoint to use.
+	InstallLogsAWSServiceEndpointEnvVar = "HIVE_INSTALL_LOGS_AWS_S3_URL"
+
+	// InstallLogsAWSS3BucketEnvVar is the environment variable specifying the S3 bucket to use.
+	InstallLogsAWSS3BucketEnvVar = "HIVE_INSTALL_LOGS_AWS_S3_BUCKET"
+
+	// ReconcileIDLen is the length of the random strings we generate for contextual loggers in controller
+	// Reconcile functions.
+	ReconcileIDLen = 8
 )
 
 // GetMergedPullSecretName returns name for merged pull secret name per cluster deployment

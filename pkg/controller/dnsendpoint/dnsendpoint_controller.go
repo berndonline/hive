@@ -3,7 +3,6 @@ package dnsendpoint
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -30,13 +29,20 @@ import (
 )
 
 const (
-	controllerName = "dnsendpoint"
+	ControllerName = hivev1.DNSEndpointControllerName
 )
 
 // Add creates a new DNSZone Controller and adds it to the Manager with default RBAC. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func Add(mgr manager.Manager) error {
-	c := controllerutils.NewClientWithMetricsOrDie(mgr, controllerName)
+	logger := log.WithField("controller", ControllerName)
+	concurrentReconciles, clientRateLimiter, queueRateLimiter, err := controllerutils.GetControllerConfig(mgr.GetClient(), ControllerName)
+	if err != nil {
+		logger.WithError(err).Error("could not get controller configurations")
+		return err
+	}
+
+	c := controllerutils.NewClientWithMetricsOrDie(mgr, ControllerName, &clientRateLimiter)
 
 	reconciler, nameServerChangeNotifier, err := newReconciler(mgr, c)
 	if err != nil {
@@ -48,11 +54,12 @@ func Add(mgr manager.Manager) error {
 	}
 
 	ctrl, err := controller.New(
-		controllerName,
+		ControllerName.String(),
 		mgr,
 		controller.Options{
 			Reconciler:              reconciler,
-			MaxConcurrentReconciles: controllerutils.GetConcurrentReconciles(),
+			MaxConcurrentReconciles: concurrentReconciles,
+			RateLimiter:             queueRateLimiter,
 		},
 	)
 	if err != nil {
@@ -63,9 +70,17 @@ func Add(mgr manager.Manager) error {
 		return err
 	}
 
+	// Watch for changes to ClusterDeployment
+	if err := ctrl.Watch(
+		&source.Kind{Type: &hivev1.ClusterDeployment{}},
+		controllerutils.EnqueueDNSZonesOwnedByClusterDeployment(reconciler, reconciler.logger),
+	); err != nil {
+		return err
+	}
+
 	if nameServerChangeNotifier != nil {
 		if err := ctrl.Watch(&source.Channel{Source: nameServerChangeNotifier}, &handler.EnqueueRequestForObject{}); err != nil {
-			log.WithField("controller", controllerName).WithError(err).Error("unable to set up watch for name server changes")
+			log.WithField("controller", ControllerName).WithError(err).Error("unable to set up watch for name server changes")
 			return err
 		}
 	}
@@ -81,7 +96,7 @@ type nameServerTool struct {
 func newReconciler(mgr manager.Manager, kubeClient client.Client) (*ReconcileDNSEndpoint, chan event.GenericEvent, error) {
 	nsTools := []nameServerTool{}
 
-	logger := log.WithField("controller", controllerName)
+	logger := log.WithField("controller", ControllerName)
 
 	reconciler := &ReconcileDNSEndpoint{
 		Client:          kubeClient,
@@ -150,19 +165,10 @@ type ReconcileDNSEndpoint struct {
 // Reconcile reads that state of the cluster for a DNSEndpoint object and makes changes based on the state read
 // and what is in the DNSEndpoint.Spec
 func (r *ReconcileDNSEndpoint) Reconcile(request reconcile.Request) (reconcile.Result, error) {
-	start := time.Now()
-	dnsLog := r.logger.WithFields(log.Fields{
-		"dnszone":   request.Name,
-		"namespace": request.Namespace,
-	})
-
-	// For logging, we need to see when the reconciliation loop starts and ends.
+	dnsLog := controllerutils.BuildControllerLogger(ControllerName, "dnsZone", request.NamespacedName)
 	dnsLog.Info("reconciling dns endpoint")
-	defer func() {
-		dur := time.Since(start)
-		hivemetrics.MetricControllerReconcileTime.WithLabelValues(controllerName).Observe(dur.Seconds())
-		dnsLog.WithField("elapsed", dur).Info("reconcile complete")
-	}()
+	recobsrv := hivemetrics.NewReconcileObserver(ControllerName, dnsLog)
+	defer recobsrv.ObserveControllerReconcileTime()
 
 	// Fetch the DNSZone object
 	instance := &hivev1.DNSZone{}
@@ -177,6 +183,12 @@ func (r *ReconcileDNSEndpoint) Reconcile(request reconcile.Request) (reconcile.R
 
 	if !instance.Spec.LinkToParentDomain {
 		return reconcile.Result{}, nil
+	}
+
+	if result, err := controllerutils.ReconcileDNSZoneForRelocation(r.Client, dnsLog, instance, hivev1.FinalizerDNSEndpoint); err != nil {
+		return reconcile.Result{}, err
+	} else if result != nil {
+		return *result, nil
 	}
 
 	isDeleted := instance.DeletionTimestamp != nil
@@ -288,6 +300,11 @@ func createNameServerQuery(c client.Client, logger log.FieldLogger, managedDomai
 		secretName := managedDomain.GCP.CredentialsSecretRef.Name
 		logger.Infof("using gcp creds for managed domain stored in %q secret", secretName)
 		return nameserver.NewGCPQuery(c, secretName)
+	}
+	if managedDomain.Azure != nil {
+		secretName := managedDomain.Azure.CredentialsSecretRef.Name
+		logger.Infof("using azure creds for managed domain stored in %q secret", secretName)
+		return nameserver.NewAzureQuery(c, secretName, managedDomain.Azure.ResourceGroupName)
 	}
 	logger.Error("unsupported cloud for managing DNS")
 	return nil

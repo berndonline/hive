@@ -4,12 +4,17 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
+	"strings"
 
+	azdns "github.com/Azure/azure-sdk-for-go/profiles/latest/dns/mgmt/dns"
 	aznetwork "github.com/Azure/azure-sdk-for-go/services/network/mgmt/2018-12-01/network"
-	aztypes "github.com/openshift/installer/pkg/types/azure"
+	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	"github.com/openshift/installer/pkg/types"
-	"k8s.io/apimachinery/pkg/util/validation/field"
+	aztypes "github.com/openshift/installer/pkg/types/azure"
 )
 
 // Validate executes platform-specific validation.
@@ -17,6 +22,7 @@ func Validate(client API, ic *types.InstallConfig) error {
 	allErrs := field.ErrorList{}
 
 	allErrs = append(allErrs, validateNetworks(client, ic.Azure, ic.Networking.MachineNetwork, field.NewPath("platform").Child("azure"))...)
+	allErrs = append(allErrs, validateRegion(client, field.NewPath("platform").Child("azure").Child("region"), ic.Azure)...)
 	return allErrs.ToAggregate()
 }
 
@@ -68,4 +74,132 @@ func validateMachineNetworksContainIP(fldPath *field.Path, networks []types.Mach
 		}
 	}
 	return field.ErrorList{field.Invalid(fldPath, subnetName, fmt.Sprintf("subnet %s address prefix is outside of the specified machine networks", ip))}
+}
+
+// validateRegion checks that the desired region is valid and available to the user
+func validateRegion(client API, fieldPath *field.Path, p *aztypes.Platform) field.ErrorList {
+	locations, err := client.ListLocations(context.TODO())
+	if err != nil {
+		return field.ErrorList{field.InternalError(fieldPath, errors.Wrap(err, "failed to retrieve available regions"))}
+	}
+
+	availableRegions := map[string]string{}
+	for _, location := range *locations {
+		availableRegions[to.String(location.Name)] = to.String(location.DisplayName)
+	}
+
+	displayName, ok := availableRegions[p.Region]
+	if !ok {
+		errMsg := fmt.Sprintf("region %q is not valid or not available for this account", p.Region)
+
+		normalizedRegion := strings.Replace(strings.ToLower(p.Region), " ", "", -1)
+		if _, ok := availableRegions[normalizedRegion]; ok {
+			errMsg += fmt.Sprintf(", did you mean %q?", normalizedRegion)
+		}
+
+		return field.ErrorList{field.Invalid(fieldPath, p.Region, errMsg)}
+
+	}
+
+	provider, err := client.GetResourcesProvider(context.TODO(), "Microsoft.Resources")
+	if err != nil {
+		return field.ErrorList{field.InternalError(fieldPath, errors.Wrap(err, "failed to retrieve resource capable regions"))}
+	}
+
+	for _, resType := range *provider.ResourceTypes {
+		if *resType.ResourceType == "resourceGroups" {
+			for _, resourceCapableRegion := range *resType.Locations {
+				if resourceCapableRegion == displayName {
+					return field.ErrorList{}
+				}
+			}
+		}
+	}
+
+	return field.ErrorList{field.Invalid(fieldPath, p.Region, fmt.Sprintf("region %q does not support resource creation", p.Region))}
+}
+
+// ValidatePublicDNS checks DNS for CNAME, A, and AAA records for
+// api.zoneName. If a record exists, it's likely a cluster already exists.
+func ValidatePublicDNS(ic *types.InstallConfig, azureDNS *DNSConfig) error {
+	// If this is an internal cluster, this check is not necessary
+	if ic.Publish == types.InternalPublishingStrategy {
+		return nil
+	}
+
+	clusterName := ic.ObjectMeta.Name
+	record := fmt.Sprintf("api.%s", clusterName)
+	rgName := ic.Azure.BaseDomainResourceGroupName
+	zoneName := ic.BaseDomain
+	fmtStr := "api.%s %s record already exists in %s and might be in use by another cluster, please remove it to continue"
+
+	// Look for an existing CNAME first
+	rs, err := azureDNS.GetDNSRecordSet(rgName, zoneName, record, azdns.CNAME)
+	if err == nil && rs.CnameRecord != nil {
+		return errors.New(fmt.Sprintf(fmtStr, zoneName, azdns.CNAME, clusterName))
+	}
+
+	// Look for an A record
+	rs, err = azureDNS.GetDNSRecordSet(rgName, zoneName, record, azdns.A)
+	if err == nil && rs.ARecords != nil && len(*rs.ARecords) > 0 {
+		return errors.New(fmt.Sprintf(fmtStr, zoneName, azdns.A, clusterName))
+	}
+
+	// Look for an AAAA record
+	rs, err = azureDNS.GetDNSRecordSet(rgName, zoneName, record, azdns.AAAA)
+	if err == nil && rs.AaaaRecords != nil && len(*rs.AaaaRecords) > 0 {
+		return errors.New(fmt.Sprintf(fmtStr, zoneName, azdns.AAAA, clusterName))
+	}
+
+	return nil
+}
+
+// ValidateForProvisioning validates if the isntall config if valid for provisioning the cluster.
+func ValidateForProvisioning(client API, ic *types.InstallConfig) error {
+	allErrs := field.ErrorList{}
+	allErrs = append(allErrs, validateResourceGroup(client, field.NewPath("platform").Child("azure"), ic.Azure)...)
+	return allErrs.ToAggregate()
+}
+
+func validateResourceGroup(client API, fieldPath *field.Path, platform *aztypes.Platform) field.ErrorList {
+	allErrs := field.ErrorList{}
+	if len(platform.ResourceGroupName) == 0 {
+		return allErrs
+	}
+	group, err := client.GetGroup(context.TODO(), platform.ResourceGroupName)
+	if err != nil {
+		return append(allErrs, field.InternalError(fieldPath.Child("resourceGroupName"), errors.Wrap(err, "failed to get resource group")))
+	}
+
+	normalizedRegion := strings.Replace(strings.ToLower(to.String(group.Location)), " ", "", -1)
+	if !strings.EqualFold(normalizedRegion, platform.Region) {
+		allErrs = append(allErrs, field.Invalid(fieldPath.Child("resourceGroupName"), platform.ResourceGroupName, fmt.Sprintf("expected to in region %s, but found it to be in %s", platform.Region, normalizedRegion)))
+	}
+
+	tagKeys := make([]string, 0, len(group.Tags))
+	for key := range group.Tags {
+		tagKeys = append(tagKeys, key)
+	}
+	sort.Strings(tagKeys)
+	conflictingTagKeys := tagKeys[:0]
+	for _, key := range tagKeys {
+		if strings.HasPrefix(key, "kubernetes.io_cluster") {
+			conflictingTagKeys = append(conflictingTagKeys, key)
+		}
+	}
+	if len(conflictingTagKeys) > 0 {
+		allErrs = append(allErrs, field.Invalid(fieldPath.Child("resourceGroupName"), platform.ResourceGroupName, fmt.Sprintf("resource group has conflicting tags %s", strings.Join(conflictingTagKeys, ", "))))
+	}
+
+	ids, err := client.ListResourceIDsByGroup(context.TODO(), platform.ResourceGroupName)
+	if err != nil {
+		return append(allErrs, field.InternalError(fieldPath.Child("resourceGroupName"), errors.Wrap(err, "failed to list resources in the resource group")))
+	}
+	if l := len(ids); l > 0 {
+		if len(ids) > 2 {
+			ids = ids[:2]
+		}
+		allErrs = append(allErrs, field.Invalid(fieldPath.Child("resourceGroupName"), platform.ResourceGroupName, fmt.Sprintf("resource group must be empty but it has %d resources like %s ...", l, strings.Join(ids, ", "))))
+	}
+	return allErrs
 }

@@ -11,9 +11,25 @@ type MachinePool struct {
 	// The instances use ephemeral disks if not set.
 	// +optional
 	RootVolume *RootVolume `json:"rootVolume,omitempty"`
+
+	// AdditionalNetworkIDs contains IDs of additional networks for machines,
+	// where each ID is presented in UUID v4 format.
+	// Allowed address pairs won't be created for the additional networks.
+	// +optional
+	AdditionalNetworkIDs []string `json:"additionalNetworkIDs,omitempty"`
+
+	// AdditionalSecurityGroupIDs contains IDs of additional security groups for machines,
+	// where each ID is presented in UUID v4 format.
+	// +optional
+	AdditionalSecurityGroupIDs []string `json:"additionalSecurityGroupIDs,omitempty"`
+
+	// Zones is the list of availability zones where the instances should be deployed.
+	// If no zones are provided, all instances will be deployed on OpenStack Nova default availability zone
+	// +optional
+	Zones []string `json:"zones,omitempty"`
 }
 
-// Set sets the values from `required` to `a`.
+// Set sets the values from `required` to `o`.
 func (o *MachinePool) Set(required *MachinePool) {
 	if required == nil || o == nil {
 		return
@@ -29,6 +45,18 @@ func (o *MachinePool) Set(required *MachinePool) {
 		}
 		o.RootVolume.Size = required.RootVolume.Size
 		o.RootVolume.Type = required.RootVolume.Type
+	}
+
+	if required.AdditionalNetworkIDs != nil {
+		o.AdditionalNetworkIDs = append(required.AdditionalNetworkIDs[:0:0], required.AdditionalNetworkIDs...)
+	}
+
+	if required.AdditionalSecurityGroupIDs != nil {
+		o.AdditionalSecurityGroupIDs = append(required.AdditionalSecurityGroupIDs[:0:0], required.AdditionalSecurityGroupIDs...)
+	}
+
+	if len(required.Zones) > 0 {
+		o.Zones = required.Zones
 	}
 }
 

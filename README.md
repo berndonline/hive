@@ -12,6 +12,9 @@ The Hive service can be used to provision and perform initial configuration of O
 * AWS
 * Azure
 * Google Cloud Platform
+* OpenStack
+* oVirt
+* vSphere
 
 In the future Hive will support more cloud providers.
 
@@ -21,6 +24,7 @@ In the future Hive will support more cloud providers.
 * [Installation](./docs/install.md)
 * [Using Hive](./docs/using-hive.md)
 * [Hiveutil CLI](./docs/hiveutil.md)
+* [Scaling Hive](./docs/scaling-hive.md)
 * [Developing Hive](./docs/developing.md)
 * [Frequently Asked Questions](./docs/FAQs.md)
 * [Troubleshooting](./docs/troubleshooting.md)

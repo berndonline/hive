@@ -1,16 +1,17 @@
 package resource
 
 import (
+	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
 	controllerutils "github.com/openshift/hive/pkg/controller/utils"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 )
 
-func (r *Helper) getKubeconfigFactory(namespace string) (cmdutil.Factory, error) {
+func (r *helper) getKubeconfigFactory(namespace string) (cmdutil.Factory, error) {
 	config, err := clientcmd.Load(r.kubeconfig)
 	if err != nil {
 		r.logger.WithError(err).Error("an error occurred loading the kubeconfig")
@@ -43,7 +44,7 @@ func (r *Helper) getKubeconfigFactory(namespace string) (cmdutil.Factory, error)
 type kubeconfigClientGetter struct {
 	clientConfig   clientcmd.ClientConfig
 	cacheDir       string
-	controllerName string
+	controllerName hivev1.ControllerName
 	metricsEnabled bool
 	restConfig     *rest.Config
 }

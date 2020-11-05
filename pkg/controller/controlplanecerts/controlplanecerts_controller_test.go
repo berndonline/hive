@@ -9,6 +9,7 @@ import (
 	"github.com/golang/mock/gomock"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,32 +22,37 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	configv1 "github.com/openshift/api/config/v1"
 	openshiftapiv1 "github.com/openshift/api/config/v1"
+
 	"github.com/openshift/hive/pkg/apis"
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
 	"github.com/openshift/hive/pkg/constants"
 	controllerutils "github.com/openshift/hive/pkg/controller/utils"
-	"github.com/openshift/hive/pkg/remoteclient"
-	mockremoteclient "github.com/openshift/hive/pkg/remoteclient/mock"
 	"github.com/openshift/hive/pkg/resource"
+	testsecret "github.com/openshift/hive/pkg/test/secret"
 )
 
 const (
-	fakeName         = "fake-cluster"
-	fakeNamespace    = "fake-namespace"
-	fakeDomain       = "example.com"
-	fakeAPIURL       = "https://test-api-url:6443"
-	fakeAPIURLDomain = "test-api-url"
+	fakeName             = "fake-cluster"
+	fakeNamespace        = "fake-namespace"
+	fakeDomain           = "example.com"
+	fakeAPIURL           = "https://test-api-url:6443"
+	fakeAPIURLDomain     = "test-api-url"
+	kubeconfigSecretName = "test-kubeconfig"
+	adminKubeconfig      = `clusters:
+- cluster:
+    server: https://test-api-url:6443
+  name: bar
+contexts:
+- context:
+    cluster: bar
+  name: admin
+current-context: admin
+`
 )
 
 func init() {
 	log.SetLevel(log.DebugLevel)
-}
-
-type fakeRemoteClientResponse struct {
-	apiURL string
-	err    error
 }
 
 func TestReconcileControlPlaneCerts(t *testing.T) {
@@ -54,21 +60,20 @@ func TestReconcileControlPlaneCerts(t *testing.T) {
 	openshiftapiv1.Install(scheme.Scheme)
 
 	tests := []struct {
-		name                 string
-		existing             []runtime.Object
-		remoteClientResponse *fakeRemoteClientResponse
-		validate             func(*testing.T, client.Client, []runtime.Object)
+		name     string
+		existing []runtime.Object
+
+		expectNoSyncSet        bool
+		expectedPatch          string
+		expectedSecrets        []string
+		expectedNotFoundStatus corev1.ConditionStatus
 	}{
 		{
 			name: "no control plane certs",
 			existing: []runtime.Object{
 				fakeClusterDeployment().obj(),
 			},
-			validate: func(t *testing.T, c client.Client, applied []runtime.Object) {
-				cd := getFakeClusterDeployment(t, c)
-				assert.Empty(t, applied, "no syncset should be applied")
-				assert.Empty(t, cd.Status.Conditions, "no conditions should be set")
-			},
+			expectNoSyncSet: true,
 		},
 		{
 			name: "default control plane certs",
@@ -76,21 +81,8 @@ func TestReconcileControlPlaneCerts(t *testing.T) {
 				fakeClusterDeployment().defaultCert("default-cert", "default-secret").obj(),
 				fakeCertSecret("default-secret"),
 			},
-			remoteClientResponse: &fakeRemoteClientResponse{
-				apiURL: fakeAPIURL,
-			},
-			validate: func(t *testing.T, c client.Client, applied []runtime.Object) {
-				cd := getFakeClusterDeployment(t, c)
-				assert.Empty(t, cd.Status.Conditions, "no conditions should be set")
-
-				validateAppliedSyncSet(t, applied, "", additionalCert(fakeAPIURLDomain, "default-secret"))
-
-				ss := applied[0].(metav1.Object)
-				labels := ss.GetLabels()
-
-				assert.Equal(t, fakeClusterDeployment().obj().Name, labels[constants.ClusterDeploymentNameLabel], "incorrect cluster deployment name label")
-				assert.Equal(t, constants.SyncSetTypeControlPlaneCerts, labels[constants.SyncSetTypeLabel], "incorrect syncset type label")
-			},
+			expectedPatch:   `[ { "op": "replace", "path": "/spec/servingCerts/namedCertificates", "value": [  { "names": [ "test-api-url" ], "servingCertificate": { "name": "fake-cluster-default-secret" } } ] } ]`,
+			expectedSecrets: []string{"default-secret"},
 		},
 		{
 			name: "additional certs only",
@@ -101,11 +93,8 @@ func TestReconcileControlPlaneCerts(t *testing.T) {
 				fakeCertSecret("secret1"),
 				fakeCertSecret("secret2"),
 			},
-			validate: func(t *testing.T, c client.Client, applied []runtime.Object) {
-				cd := getFakeClusterDeployment(t, c)
-				assert.Empty(t, cd.Status.Conditions, "no conditions should be set")
-				validateAppliedSyncSet(t, applied, "", additionalCert("foo.com", "secret1"), additionalCert("bar.com", "secret2"))
-			},
+			expectedPatch:   `[ { "op": "replace", "path": "/spec/servingCerts/namedCertificates", "value": [  { "names": [ "foo.com" ], "servingCertificate": { "name": "fake-cluster-secret1" } }, { "names": [ "bar.com" ], "servingCertificate": { "name": "fake-cluster-secret2" } } ] } ]`,
+			expectedSecrets: []string{"secret1", "secret2"},
 		},
 		{
 			name: "default and additional certs",
@@ -119,15 +108,8 @@ func TestReconcileControlPlaneCerts(t *testing.T) {
 				fakeCertSecret("secret1"),
 				fakeCertSecret("secret2"),
 			},
-			remoteClientResponse: &fakeRemoteClientResponse{
-				apiURL: fakeAPIURL,
-			},
-			validate: func(t *testing.T, c client.Client, applied []runtime.Object) {
-				cd := getFakeClusterDeployment(t, c)
-				assert.Empty(t, cd.Status.Conditions, "no conditions should be set")
-
-				validateAppliedSyncSet(t, applied, "", additionalCert(fakeAPIURLDomain, "secret0"), additionalCert("foo.com", "secret1"), additionalCert("bar.com", "secret2"))
-			},
+			expectedPatch:   `[ { "op": "replace", "path": "/spec/servingCerts/namedCertificates", "value": [  { "names": [ "test-api-url" ], "servingCertificate": { "name": "fake-cluster-secret0" } }, { "names": [ "foo.com" ], "servingCertificate": { "name": "fake-cluster-secret1" } }, { "names": [ "bar.com" ], "servingCertificate": { "name": "fake-cluster-secret2" } } ] } ]`,
+			expectedSecrets: []string{"secret0", "secret1", "secret2"},
 		},
 		{
 			name: "missing secret",
@@ -139,65 +121,48 @@ func TestReconcileControlPlaneCerts(t *testing.T) {
 				fakeCertSecret("secret0"),
 				fakeCertSecret("secret2"),
 			},
-			validate: func(t *testing.T, c client.Client, applied []runtime.Object) {
-				assert.Empty(t, applied)
-				cd := getFakeClusterDeployment(t, c)
-				assert.Equal(t, 1, len(cd.Status.Conditions))
-				notFoundCondition := controllerutils.FindClusterDeploymentCondition(cd.Status.Conditions, hivev1.ControlPlaneCertificateNotFoundCondition)
-				assert.NotNil(t, notFoundCondition)
-				assert.Equal(t, notFoundCondition.Status, corev1.ConditionTrue)
-			},
+			expectNoSyncSet:        true,
+			expectedNotFoundStatus: corev1.ConditionTrue,
 		},
 		{
-			name: "existing syncset, remove certs",
+			name: "existing syncset remove certs",
 			existing: []runtime.Object{
 				fakeClusterDeployment().obj(),
 				fakeSyncSet(),
 			},
-			validate: func(t *testing.T, c client.Client, applied []runtime.Object) {
-				validateAppliedSyncSet(t, applied, "")
-			},
+			expectedPatch: `[ { "op": "replace", "path": "/spec/servingCerts/namedCertificates", "value": [  ] } ]`,
 		},
 		{
-			name: "existing not found condition, change to false",
+			name: "existing not found condition changed to false",
 			existing: []runtime.Object{
-				fakeClusterDeployment().defaultCert("defaut", "test-secret").withNotFoundCondition().obj(),
+				fakeClusterDeployment().defaultCert("default", "test-secret").withNotFoundCondition().obj(),
 				fakeCertSecret("test-secret"),
 			},
-			validate: func(t *testing.T, c client.Client, applied []runtime.Object) {
-				cd := getFakeClusterDeployment(t, c)
-				assert.Equal(t, 1, len(cd.Status.Conditions))
-				notFoundCondition := controllerutils.FindClusterDeploymentCondition(cd.Status.Conditions, hivev1.ControlPlaneCertificateNotFoundCondition)
-				assert.NotNil(t, notFoundCondition)
-				assert.Equal(t, string(corev1.ConditionFalse), string(notFoundCondition.Status))
-			},
+			// no apply expected because we update the condition and return immediately, next reconcile would apply
+			expectNoSyncSet:        true,
+			expectedNotFoundStatus: corev1.ConditionFalse,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			test.existing = append(test.existing,
+				testsecret.Build(
+					testsecret.WithName(kubeconfigSecretName),
+					testsecret.WithNamespace(fakeNamespace),
+					testsecret.WithDataKeyValue(constants.KubeconfigSecretKey, []byte(adminKubeconfig)),
+				),
+			)
 			fakeClient := fake.NewFakeClient(test.existing...)
 
 			mockController := gomock.NewController(t)
 			defer mockController.Finish()
-
-			mockRemoteClientBuilder := mockremoteclient.NewMockBuilder(mockController)
-			if test.remoteClientResponse != nil {
-				mockRemoteClientBuilder.EXPECT().UseSecondaryAPIURL().Return(mockRemoteClientBuilder)
-				mockRemoteClientBuilder.EXPECT().APIURL().Return(
-					test.remoteClientResponse.apiURL,
-					test.remoteClientResponse.err,
-				)
-			}
 
 			applier := &fakeApplier{}
 			r := &ReconcileControlPlaneCerts{
 				Client:  fakeClient,
 				scheme:  scheme.Scheme,
 				applier: applier,
-				remoteClientBuilder: func(*hivev1.ClusterDeployment) remoteclient.Builder {
-					return mockRemoteClientBuilder
-				},
 			}
 
 			_, err := r.Reconcile(reconcile.Request{
@@ -209,8 +174,44 @@ func TestReconcileControlPlaneCerts(t *testing.T) {
 
 			assert.Nil(t, err)
 
-			if test.validate != nil {
-				test.validate(t, fakeClient, applier.appliedObjects)
+			cd := getFakeClusterDeployment(t, fakeClient)
+
+			if test.expectNoSyncSet {
+				assert.Len(t, applier.appliedObjects, 0, "unexpected syncset apply")
+			} else {
+				require.Len(t, applier.appliedObjects, 1, "single apply expected")
+				require.IsType(t, &hivev1.SyncSet{}, applier.appliedObjects[0], "syncset apply expected")
+				ss := applier.appliedObjects[0].(*hivev1.SyncSet)
+
+				// Resources should have been removed from the SyncSet
+				assert.Equal(t, 0, len(ss.Spec.Resources))
+
+				// Expect our patch, plus one to force the kubeapiserver redeploy:
+				require.Equal(t, 2, len(ss.Spec.Patches))
+				assert.Equal(t, test.expectedPatch, ss.Spec.Patches[0].Patch)
+
+				secretMappings := ss.Spec.Secrets
+				require.Equal(t, len(test.expectedSecrets), len(secretMappings))
+
+				// Ensure there are no duplicate Secret names
+				names := secretNames(secretMappings)
+				assert.Equal(t, sets.NewString(names...).Len(), len(names), "duplicate secret names present")
+				for i, sn := range test.expectedSecrets {
+					assert.Equal(t, hivev1.SecretReference{Name: sn, Namespace: fakeNamespace}, ss.Spec.Secrets[i].SourceRef)
+				}
+
+				labels := ss.GetLabels()
+
+				assert.Equal(t, fakeClusterDeployment().obj().Name, labels[constants.ClusterDeploymentNameLabel], "incorrect cluster deployment name label")
+				assert.Equal(t, constants.SyncSetTypeControlPlaneCerts, labels[constants.SyncSetTypeLabel], "incorrect syncset type label")
+			}
+
+			notFoundCondition := controllerutils.FindClusterDeploymentCondition(cd.Status.Conditions, hivev1.ControlPlaneCertificateNotFoundCondition)
+			if test.expectedNotFoundStatus != "" {
+				assert.NotNil(t, notFoundCondition, "expected a NotFound condition")
+				assert.Equal(t, test.expectedNotFoundStatus, notFoundCondition.Status, "unexpected NotFound status")
+			} else {
+				assert.Nil(t, notFoundCondition, "test did not specify an expectedNotFoundStatus but condition was present")
 			}
 
 		})
@@ -323,9 +324,16 @@ func fakeClusterDeployment() *fakeClusterDeploymentWrapper {
 			ClusterName: fakeName,
 			BaseDomain:  fakeDomain,
 			Installed:   true,
+			ClusterMetadata: &hivev1.ClusterMetadata{
+				AdminKubeconfigSecretRef: corev1.LocalObjectReference{Name: kubeconfigSecretName},
+			},
 		},
 		Status: hivev1.ClusterDeploymentStatus{
 			APIURL: fakeAPIURL,
+			Conditions: []hivev1.ClusterDeploymentCondition{{
+				Type:   hivev1.UnreachableCondition,
+				Status: corev1.ConditionFalse,
+			}},
 		},
 	}
 	return &fakeClusterDeploymentWrapper{cd: cd}
@@ -377,8 +385,8 @@ func fakeCertSecret(name string) *corev1.Secret {
 	s.Name = name
 	s.Namespace = fakeNamespace
 	s.Data = map[string][]byte{
-		"tls.key": []byte("blah"),
-		"tls.crt": []byte("blah"),
+		constants.TLSKeySecretKey: []byte("blah"),
+		constants.TLSCrtSecretKey: []byte("blah"),
 	}
 	s.Type = corev1.SecretTypeTLS
 	return s
@@ -396,51 +404,11 @@ func additionalCert(domain, secret string) additionalCertSpec {
 	}
 }
 
-func validateAppliedSyncSet(t *testing.T, objs []runtime.Object, defaultSecret string, additional ...additionalCertSpec) {
-	assert.Len(t, objs, 1, "single syncset expected")
-	assert.IsType(t, &hivev1.SyncSet{}, objs[0], "syncset object expected")
-	ss := objs[0].(*hivev1.SyncSet)
-	secretMappings := ss.Spec.Secrets
-	var apiServerConfig *configv1.APIServer
-	for _, rr := range ss.Spec.Resources {
-		if config, ok := rr.Object.(*configv1.APIServer); ok {
-			apiServerConfig = config
-			continue
-		}
-		assert.Fail(t, "unexpected resource type", "syncset resource type: %T", rr.Object)
-	}
-	// Ensure there are no duplicate names
-	names := secretNames(secretMappings)
-	assert.Equal(t, sets.NewString(names...).Len(), len(names))
-
-	if defaultSecret != "" {
-		s := findSecret(secretMappings, defaultSecret)
-		assert.NotNil(t, s)
-		assert.Equal(t, apiServerConfig.Spec.ServingCerts.DefaultServingCertificate.Name, s)
-	} else {
-		assert.Empty(t, apiServerConfig.Spec.ServingCerts.DefaultServingCertificate.Name)
-	}
-
-	for i, c := range additional {
-		s := findSecret(secretMappings, c.secret)
-		assert.NotNil(t, s)
-		assert.Contains(t, apiServerConfig.Spec.ServingCerts.NamedCertificates[i].Names, c.domain)
-		assert.Equal(t, apiServerConfig.Spec.ServingCerts.NamedCertificates[i].ServingCertificate.Name, c.secret)
-	}
-	if len(additional) == 0 {
-		assert.Empty(t, apiServerConfig.Spec.ServingCerts.NamedCertificates)
-	}
-
-	// If not setting any secrets, ensure they're empty
-	if defaultSecret == "" && len(additional) == 0 {
-		assert.Empty(t, secretMappings)
-	}
-}
-
 func fakeSyncSet() *hivev1.SyncSet {
 	ss := &hivev1.SyncSet{}
 	ss.Namespace = fakeNamespace
 	ss.Name = GenerateControlPlaneCertsSyncSetName(fakeName)
+	// Simulated legacy resources, should be migrated to a patch after reconcile.
 	ss.Spec.Resources = []runtime.RawExtension{
 		{
 			Object: fakeCertSecret("foo1"),

@@ -8,6 +8,7 @@ import (
 	gomock "github.com/golang/mock/gomock"
 	remoteclient "github.com/openshift/hive/pkg/remoteclient"
 	dynamic "k8s.io/client-go/dynamic"
+	kubernetes "k8s.io/client-go/kubernetes"
 	rest "k8s.io/client-go/rest"
 	reflect "reflect"
 	client "sigs.k8s.io/controller-runtime/pkg/client"
@@ -66,33 +67,19 @@ func (mr *MockBuilderMockRecorder) BuildDynamic() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BuildDynamic", reflect.TypeOf((*MockBuilder)(nil).BuildDynamic))
 }
 
-// Unreachable mocks base method
-func (m *MockBuilder) Unreachable() bool {
+// BuildKubeClient mocks base method
+func (m *MockBuilder) BuildKubeClient() (kubernetes.Interface, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Unreachable")
-	ret0, _ := ret[0].(bool)
-	return ret0
-}
-
-// Unreachable indicates an expected call of Unreachable
-func (mr *MockBuilderMockRecorder) Unreachable() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Unreachable", reflect.TypeOf((*MockBuilder)(nil).Unreachable))
-}
-
-// APIURL mocks base method
-func (m *MockBuilder) APIURL() (string, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "APIURL")
-	ret0, _ := ret[0].(string)
+	ret := m.ctrl.Call(m, "BuildKubeClient")
+	ret0, _ := ret[0].(kubernetes.Interface)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// APIURL indicates an expected call of APIURL
-func (mr *MockBuilderMockRecorder) APIURL() *gomock.Call {
+// BuildKubeClient indicates an expected call of BuildKubeClient
+func (mr *MockBuilderMockRecorder) BuildKubeClient() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "APIURL", reflect.TypeOf((*MockBuilder)(nil).APIURL))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BuildKubeClient", reflect.TypeOf((*MockBuilder)(nil).BuildKubeClient))
 }
 
 // RESTConfig mocks base method

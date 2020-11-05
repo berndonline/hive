@@ -2,21 +2,28 @@ package resource
 
 import (
 	"bytes"
+	"context"
 	"io"
 
+	"github.com/jonboulle/clockwork"
+
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/printers"
-	kcmdapply "k8s.io/kubernetes/pkg/kubectl/cmd/apply"
+	kresource "k8s.io/cli-runtime/pkg/resource"
+	kcmdapply "k8s.io/kubectl/pkg/cmd/apply"
 
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 )
 
 // ApplyResult indicates what type of change was performed
 // by calling the Apply function
 type ApplyResult string
 
-var (
+const (
 	// ConfiguredApplyResult is returned when a patch was submitted
 	ConfiguredApplyResult ApplyResult = "configured"
 
@@ -30,14 +37,10 @@ var (
 	UnknownApplyResult ApplyResult = "unknown"
 )
 
+const fieldTooLong metav1.CauseType = "FieldValueTooLong"
+
 // Apply applies the given resource bytes to the target cluster specified by kubeconfig
-func (r *Helper) Apply(obj []byte) (ApplyResult, error) {
-	fileName, err := r.createTempFile("apply-", obj)
-	if err != nil {
-		r.logger.WithError(err).Error("failed to create temp file for apply")
-		return "", err
-	}
-	defer r.deleteTempFile(fileName)
+func (r *helper) Apply(obj []byte) (ApplyResult, error) {
 	factory, err := r.getFactory("")
 	if err != nil {
 		r.logger.WithError(err).Error("failed to obtain factory for apply")
@@ -48,7 +51,7 @@ func (r *Helper) Apply(obj []byte) (ApplyResult, error) {
 		Out:    &bytes.Buffer{},
 		ErrOut: &bytes.Buffer{},
 	}
-	applyOptions, changeTracker, err := r.setupApplyCommand(factory, fileName, ioStreams)
+	applyOptions, changeTracker, err := r.setupApplyCommand(factory, obj, ioStreams)
 	if err != nil {
 		r.logger.WithError(err).Error("failed to setup apply command")
 		return "", err
@@ -57,23 +60,141 @@ func (r *Helper) Apply(obj []byte) (ApplyResult, error) {
 	if err != nil {
 		r.logger.WithError(err).
 			WithField("stdout", ioStreams.Out.(*bytes.Buffer).String()).
-			WithField("stderr", ioStreams.ErrOut.(*bytes.Buffer).String()).Error("running the apply command failed")
+			WithField("stderr", ioStreams.ErrOut.(*bytes.Buffer).String()).Warn("running the apply command failed")
 		return "", err
 	}
 	return changeTracker.GetResult(), nil
 }
 
 // ApplyRuntimeObject serializes an object and applies it to the target cluster specified by the kubeconfig.
-func (r *Helper) ApplyRuntimeObject(obj runtime.Object, scheme *runtime.Scheme) (ApplyResult, error) {
-	data, err := r.Serialize(obj, scheme)
+func (r *helper) ApplyRuntimeObject(obj runtime.Object, scheme *runtime.Scheme) (ApplyResult, error) {
+	data, err := Serialize(obj, scheme)
 	if err != nil {
-		r.logger.WithError(err).Error("cannot serialize runtime object")
+		r.logger.WithError(err).Warn("cannot serialize runtime object")
 		return "", err
 	}
 	return r.Apply(data)
 }
 
-func (r *Helper) setupApplyCommand(f cmdutil.Factory, fileName string, ioStreams genericclioptions.IOStreams) (*kcmdapply.ApplyOptions, *changeTracker, error) {
+func (r *helper) CreateOrUpdate(obj []byte) (ApplyResult, error) {
+	factory, err := r.getFactory("")
+	if err != nil {
+		r.logger.WithError(err).Error("failed to obtain factory for apply")
+		return "", err
+	}
+
+	errOut := &bytes.Buffer{}
+	result, err := r.createOrUpdate(factory, obj, errOut)
+	if err != nil {
+		r.logger.WithError(err).
+			WithField("stderr", errOut.String()).Warn("running the apply command failed")
+		return "", err
+	}
+	return result, nil
+}
+
+func (r *helper) CreateOrUpdateRuntimeObject(obj runtime.Object, scheme *runtime.Scheme) (ApplyResult, error) {
+	data, err := Serialize(obj, scheme)
+	if err != nil {
+		r.logger.WithError(err).Warn("cannot serialize runtime object")
+		return "", err
+	}
+	return r.CreateOrUpdate(data)
+}
+
+func (r *helper) Create(obj []byte) (ApplyResult, error) {
+	factory, err := r.getFactory("")
+	if err != nil {
+		r.logger.WithError(err).Error("failed to obtain factory for apply")
+		return "", err
+	}
+	result, err := r.createOnly(factory, obj)
+	if err != nil {
+		r.logger.WithError(err).Warn("running the create command failed")
+		return "", err
+	}
+	return result, nil
+}
+
+func (r *helper) CreateRuntimeObject(obj runtime.Object, scheme *runtime.Scheme) (ApplyResult, error) {
+	data, err := Serialize(obj, scheme)
+	if err != nil {
+		r.logger.WithError(err).Warn("cannot serialize runtime object")
+		return "", err
+	}
+	return r.Create(data)
+}
+
+func (r *helper) createOnly(f cmdutil.Factory, obj []byte) (ApplyResult, error) {
+	info, err := r.getResourceInternalInfo(f, obj)
+	if err != nil {
+		return "", err
+	}
+	c, err := f.DynamicClient()
+	if err != nil {
+		return "", err
+	}
+	if err = info.Get(); err != nil {
+		if !errors.IsNotFound(err) {
+			return "", err
+		}
+		// Object doesn't exist yet, create it
+		gvr := info.ResourceMapping().Resource
+		_, err := c.Resource(gvr).Namespace(info.Namespace).Create(context.TODO(), info.Object.(*unstructured.Unstructured), metav1.CreateOptions{})
+		if err != nil {
+			return "", err
+		}
+		return CreatedApplyResult, nil
+	}
+	return UnchangedApplyResult, nil
+}
+
+func (r *helper) createOrUpdate(f cmdutil.Factory, obj []byte, errOut io.Writer) (ApplyResult, error) {
+	info, err := r.getResourceInternalInfo(f, obj)
+	if err != nil {
+		return "", err
+	}
+	c, err := f.DynamicClient()
+	if err != nil {
+		return "", err
+	}
+	sourceObj := info.Object.DeepCopyObject()
+	if err = info.Get(); err != nil {
+		if !errors.IsNotFound(err) {
+			return "", err
+		}
+		// Object doesn't exist yet, create it
+		gvr := info.ResourceMapping().Resource
+		_, err := c.Resource(gvr).Namespace(info.Namespace).Create(context.TODO(), info.Object.(*unstructured.Unstructured), metav1.CreateOptions{})
+		if err != nil {
+			return "", err
+		}
+		return CreatedApplyResult, nil
+	}
+	openAPISchema, _ := f.OpenAPISchema()
+	patcher := kcmdapply.Patcher{
+		Mapping:       info.Mapping,
+		Helper:        kresource.NewHelper(info.Client, info.Mapping),
+		Overwrite:     true,
+		BackOff:       clockwork.NewRealClock(),
+		OpenapiSchema: openAPISchema,
+	}
+	sourceBytes, err := runtime.Encode(unstructured.UnstructuredJSONScheme, sourceObj)
+	if err != nil {
+		return "", err
+	}
+	patch, _, err := patcher.Patch(info.Object, sourceBytes, info.Source, info.Namespace, info.Name, errOut)
+	if err != nil {
+		return "", err
+	}
+	result := ConfiguredApplyResult
+	if string(patch) == "{}" {
+		result = UnchangedApplyResult
+	}
+	return result, nil
+}
+
+func (r *helper) setupApplyCommand(f cmdutil.Factory, obj []byte, ioStreams genericclioptions.IOStreams) (*kcmdapply.ApplyOptions, *changeTracker, error) {
 	r.logger.Debug("setting up apply command")
 	o := kcmdapply.NewApplyOptions(ioStreams)
 	dynamicClient, err := f.DynamicClient()
@@ -105,7 +226,11 @@ func (r *Helper) setupApplyCommand(f cmdutil.Factory, fileName string, ioStreams
 		internalToPrinter: func(string) (printers.ResourcePrinter, error) { return o.PrintFlags.ToPrinter() },
 	}
 	o.ToPrinter = tracker.ToPrinter
-	o.DeleteOptions.FilenameOptions.Filenames = []string{fileName}
+	info, err := r.getResourceInternalInfo(f, obj)
+	if err != nil {
+		return nil, nil, err
+	}
+	o.SetObjects([]*kresource.Info{info})
 	return o, tracker, nil
 }
 

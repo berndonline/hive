@@ -2,14 +2,15 @@ package clusterversion
 
 import (
 	"context"
-	"reflect"
-	"time"
+	"fmt"
 
+	"github.com/blang/semver/v4"
 	log "github.com/sirupsen/logrus"
-
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/flowcontrol"
+	"k8s.io/client-go/util/workqueue"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -19,7 +20,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	openshiftapiv1 "github.com/openshift/api/config/v1"
+
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
+	"github.com/openshift/hive/pkg/constants"
 	hivemetrics "github.com/openshift/hive/pkg/controller/metrics"
 	controllerutils "github.com/openshift/hive/pkg/controller/utils"
 	"github.com/openshift/hive/pkg/remoteclient"
@@ -27,31 +30,41 @@ import (
 
 const (
 	clusterVersionObjectName = "version"
-	controllerName           = "clusterversion"
+	ControllerName           = hivev1.ClusterVersionControllerName
 )
 
 // Add creates a new ClusterDeployment Controller and adds it to the Manager with default RBAC. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func Add(mgr manager.Manager) error {
-	return AddToManager(mgr, NewReconciler(mgr))
+	logger := log.WithField("controller", ControllerName)
+	concurrentReconciles, clientRateLimiter, queueRateLimiter, err := controllerutils.GetControllerConfig(mgr.GetClient(), ControllerName)
+	if err != nil {
+		logger.WithError(err).Error("could not get controller configurations")
+		return err
+	}
+	return AddToManager(mgr, NewReconciler(mgr, clientRateLimiter), concurrentReconciles, queueRateLimiter)
 }
 
 // NewReconciler returns a new reconcile.Reconciler
-func NewReconciler(mgr manager.Manager) reconcile.Reconciler {
+func NewReconciler(mgr manager.Manager, rateLimiter flowcontrol.RateLimiter) reconcile.Reconciler {
 	r := &ReconcileClusterVersion{
-		Client: controllerutils.NewClientWithMetricsOrDie(mgr, controllerName),
+		Client: controllerutils.NewClientWithMetricsOrDie(mgr, ControllerName, &rateLimiter),
 		scheme: mgr.GetScheme(),
 	}
 	r.remoteClusterAPIClientBuilder = func(cd *hivev1.ClusterDeployment) remoteclient.Builder {
-		return remoteclient.NewBuilder(r.Client, cd, controllerName)
+		return remoteclient.NewBuilder(r.Client, cd, ControllerName)
 	}
 	return r
 }
 
 // AddToManager adds a new Controller to mgr with r as the reconcile.Reconciler
-func AddToManager(mgr manager.Manager, r reconcile.Reconciler) error {
+func AddToManager(mgr manager.Manager, r reconcile.Reconciler, concurrentReconciles int, rateLimiter workqueue.RateLimiter) error {
 	// Create a new controller
-	c, err := controller.New("clusterversion-controller", mgr, controller.Options{Reconciler: r, MaxConcurrentReconciles: controllerutils.GetConcurrentReconciles()})
+	c, err := controller.New("clusterversion-controller", mgr, controller.Options{
+		Reconciler:              r,
+		MaxConcurrentReconciles: concurrentReconciles,
+		RateLimiter:             rateLimiter,
+	})
 	if err != nil {
 		return err
 	}
@@ -80,25 +93,16 @@ type ReconcileClusterVersion struct {
 // Reconcile reads that state of the cluster for a ClusterDeployment object and syncs the remote ClusterVersion status
 // if the remote cluster is available.
 func (r *ReconcileClusterVersion) Reconcile(request reconcile.Request) (reconcile.Result, error) {
-	start := time.Now()
-	cdLog := log.WithFields(log.Fields{
-		"clusterDeployment": request.Name,
-		"namespace":         request.Namespace,
-		"controller":        controllerName,
-	})
-
+	cdLog := controllerutils.BuildControllerLogger(ControllerName, "clusterDeployment", request.NamespacedName)
 	cdLog.Info("reconciling cluster deployment")
-	defer func() {
-		dur := time.Since(start)
-		hivemetrics.MetricControllerReconcileTime.WithLabelValues(controllerName).Observe(dur.Seconds())
-		cdLog.WithField("elapsed", dur).Info("reconcile complete")
-	}()
+	recobsrv := hivemetrics.NewReconcileObserver(ControllerName, cdLog)
+	defer recobsrv.ObserveControllerReconcileTime()
 
 	// Fetch the ClusterDeployment instance
 	cd := &hivev1.ClusterDeployment{}
 	err := r.Get(context.TODO(), request.NamespacedName, cd)
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if apierrors.IsNotFound(err) {
 			// Object not found, return.  Created objects are automatically garbage collected.
 			// For additional cleanup logic use finalizers.
 			return reconcile.Result{}, nil
@@ -122,18 +126,14 @@ func (r *ReconcileClusterVersion) Reconcile(request reconcile.Request) (reconcil
 		return reconcile.Result{}, nil
 	}
 
-	remoteClientBuilder := r.remoteClusterAPIClientBuilder(cd)
-
-	// If the cluster is unreachable, do not reconcile.
-	if remoteClientBuilder.Unreachable() {
-		cdLog.Debug("skipping cluster with unreachable condition")
-		return reconcile.Result{}, nil
-	}
-
-	remoteClient, err := remoteClientBuilder.Build()
-	if err != nil {
-		cdLog.WithError(err).Error("error building remote cluster-api client connection")
-		return reconcile.Result{}, err
+	remoteClient, unreachable, requeue := remoteclient.ConnectToRemoteCluster(
+		cd,
+		r.remoteClusterAPIClientBuilder(cd),
+		r.Client,
+		cdLog,
+	)
+	if unreachable {
+		return reconcile.Result{Requeue: requeue}, nil
 	}
 
 	clusterVersion := &openshiftapiv1.ClusterVersion{}
@@ -143,8 +143,7 @@ func (r *ReconcileClusterVersion) Reconcile(request reconcile.Request) (reconcil
 		return reconcile.Result{}, err
 	}
 
-	err = r.updateClusterVersionStatus(cd, clusterVersion, cdLog)
-	if err != nil {
+	if err := r.updateClusterVersionLabels(cd, clusterVersion, cdLog); err != nil {
 		return reconcile.Result{}, err
 	}
 
@@ -152,21 +151,37 @@ func (r *ReconcileClusterVersion) Reconcile(request reconcile.Request) (reconcil
 	return reconcile.Result{}, nil
 }
 
-func (r *ReconcileClusterVersion) updateClusterVersionStatus(cd *hivev1.ClusterDeployment, clusterVersion *openshiftapiv1.ClusterVersion, cdLog log.FieldLogger) error {
-	origCD := cd.DeepCopy()
-	cdLog.WithField("clusterversion.status", clusterVersion.Status).Debug("remote cluster version status")
-	clusterVersion.Status.DeepCopyInto(&cd.Status.ClusterVersionStatus)
+func (r *ReconcileClusterVersion) updateClusterVersionLabels(cd *hivev1.ClusterDeployment, clusterVersion *openshiftapiv1.ClusterVersion, cdLog log.FieldLogger) error {
+	changed := false
+	if version, err := semver.ParseTolerant(clusterVersion.Status.Desired.Version); err == nil {
+		if cd.Labels == nil {
+			cd.Labels = make(map[string]string, 3)
+		}
+		major := fmt.Sprintf("%d", version.Major)
+		majorMinor := fmt.Sprintf("%s.%d", major, version.Minor)
+		majorMinorPatch := fmt.Sprintf("%s.%d", majorMinor, version.Patch)
+		changed = cd.Labels[constants.VersionMajorLabel] != major ||
+			cd.Labels[constants.VersionMajorMinorLabel] != majorMinor ||
+			cd.Labels[constants.VersionMajorMinorPatchLabel] != majorMinorPatch
+		cd.Labels[constants.VersionMajorLabel] = major
+		cd.Labels[constants.VersionMajorMinorLabel] = majorMinor
+		cd.Labels[constants.VersionMajorMinorPatchLabel] = majorMinorPatch
+	} else {
+		cdLog.WithField("version", clusterVersion.Status.Desired.Version).WithError(err).Warn("could not parse the cluster version")
+		origLen := len(cd.Labels)
+		delete(cd.Labels, constants.VersionMajorLabel)
+		delete(cd.Labels, constants.VersionMajorMinorLabel)
+		delete(cd.Labels, constants.VersionMajorMinorPatchLabel)
+		changed = origLen != len(cd.Labels)
+	}
 
-	if reflect.DeepEqual(cd.Status, origCD.Status) {
-		cdLog.Debug("status has not changed, nothing to update")
+	if !changed {
+		cdLog.Debug("labels have not changed, nothing to update")
 		return nil
 	}
 
-	// Update cluster deployment status if changed:
-	cdLog.Infof("status has changed, updating cluster deployment")
-	err := r.Status().Update(context.TODO(), cd)
-	if err != nil {
-		cdLog.WithError(err).Log(controllerutils.LogLevel(err), "error updating cluster deployment status")
+	if err := r.Update(context.TODO(), cd); err != nil {
+		cdLog.WithError(err).Log(controllerutils.LogLevel(err), "error update cluster deployment labels")
 		return err
 	}
 	return nil

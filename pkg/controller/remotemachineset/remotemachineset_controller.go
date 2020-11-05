@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
-	"time"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -36,10 +35,10 @@ import (
 )
 
 const (
-	controllerName = "remotemachineset"
-
-	machinePoolNameLabel = "hive.openshift.io/machine-pool"
-	finalizer            = "hive.openshift.io/remotemachineset"
+	ControllerName             = hivev1.RemoteMachinesetControllerName
+	machinePoolNameLabel       = "hive.openshift.io/machine-pool"
+	finalizer                  = "hive.openshift.io/remotemachineset"
+	masterMachineLabelSelector = "machine.openshift.io/cluster-api-machine-type=master"
 )
 
 // controllerKind contains the schema.GroupVersionKind for this controller type.
@@ -48,22 +47,49 @@ var controllerKind = hivev1.SchemeGroupVersion.WithKind("MachinePool")
 // Add creates a new RemoteMachineSet Controller and adds it to the Manager with default RBAC. The Manager will set fields on the
 // Controller and Start it when the Manager is Started.
 func Add(mgr manager.Manager) error {
-	logger := log.WithField("controller", controllerName)
+	logger := log.WithField("controller", ControllerName)
+
+	scheme := mgr.GetScheme()
+	if err := addAWSProviderToScheme(scheme); err != nil {
+		return errors.Wrap(err, "cannot add AWS provider to scheme")
+	}
+	if err := addGCPProviderToScheme(scheme); err != nil {
+		return errors.Wrap(err, "cannot add GCP provider to scheme")
+	}
+	if err := addOpenStackProviderToScheme(scheme); err != nil {
+		return errors.Wrap(err, "cannot add OpenStack provider to scheme")
+	}
+	if err := addOvirtProviderToScheme(scheme); err != nil {
+		return errors.Wrap(err, "cannot add OVirt provider to scheme")
+	}
+	if err := addVSphereProviderToScheme(scheme); err != nil {
+		return errors.Wrap(err, "cannot add vSphere provider to scheme")
+	}
+	concurrentReconciles, clientRateLimiter, queueRateLimiter, err := controllerutils.GetControllerConfig(mgr.GetClient(), ControllerName)
+	if err != nil {
+		logger.WithError(err).Error("could not get controller configurations")
+		return err
+	}
+
 	r := &ReconcileRemoteMachineSet{
-		Client:       controllerutils.NewClientWithMetricsOrDie(mgr, controllerName),
+		Client:       controllerutils.NewClientWithMetricsOrDie(mgr, ControllerName, &clientRateLimiter),
 		scheme:       mgr.GetScheme(),
 		logger:       logger,
 		expectations: controllerutils.NewExpectations(logger),
 	}
-	r.actuatorBuilder = func(cd *hivev1.ClusterDeployment, remoteMachineSets []machineapi.MachineSet, logger log.FieldLogger) (Actuator, error) {
-		return r.createActuator(cd, remoteMachineSets, logger)
+	r.actuatorBuilder = func(cd *hivev1.ClusterDeployment, pool *hivev1.MachinePool, masterMachine *machineapi.Machine, remoteMachineSets []machineapi.MachineSet, logger log.FieldLogger) (Actuator, error) {
+		return r.createActuator(cd, pool, masterMachine, remoteMachineSets, logger)
 	}
 	r.remoteClusterAPIClientBuilder = func(cd *hivev1.ClusterDeployment) remoteclient.Builder {
-		return remoteclient.NewBuilder(r.Client, cd, controllerName)
+		return remoteclient.NewBuilder(r.Client, cd, ControllerName)
 	}
 
 	// Create a new controller
-	c, err := controller.New("remotemachineset-controller", mgr, controller.Options{Reconciler: r, MaxConcurrentReconciles: controllerutils.GetConcurrentReconciles()})
+	c, err := controller.New("remotemachineset-controller", mgr, controller.Options{
+		Reconciler:              r,
+		MaxConcurrentReconciles: concurrentReconciles,
+		RateLimiter:             queueRateLimiter,
+	})
 	if err != nil {
 		return err
 	}
@@ -133,7 +159,13 @@ type ReconcileRemoteMachineSet struct {
 	remoteClusterAPIClientBuilder func(cd *hivev1.ClusterDeployment) remoteclient.Builder
 
 	// actuatorBuilder is a function pointer to the function that builds the actuator
-	actuatorBuilder func(cd *hivev1.ClusterDeployment, remoteMachineSets []machineapi.MachineSet, logger log.FieldLogger) (Actuator, error)
+	actuatorBuilder func(
+		cd *hivev1.ClusterDeployment,
+		pool *hivev1.MachinePool,
+		masterMachine *machineapi.Machine,
+		remoteMachineSets []machineapi.MachineSet,
+		logger log.FieldLogger,
+	) (Actuator, error)
 
 	// A TTLCache of machinepoolnamelease creates each machinepool expects to see. Note that not all actuators make use
 	// of expectations.
@@ -143,18 +175,10 @@ type ReconcileRemoteMachineSet struct {
 // Reconcile reads that state of the cluster for a MachinePool object and makes changes to the
 // remote cluster MachineSets based on the state read
 func (r *ReconcileRemoteMachineSet) Reconcile(request reconcile.Request) (reconcile.Result, error) {
-	start := time.Now()
-	logger := r.logger.WithFields(log.Fields{
-		"machinePool": request.Name,
-		"namespace":   request.Namespace,
-	})
+	logger := controllerutils.BuildControllerLogger(ControllerName, "machinePool", request.NamespacedName)
 	logger.Info("reconciling machine pool")
-
-	defer func() {
-		dur := time.Since(start)
-		hivemetrics.MetricControllerReconcileTime.WithLabelValues(controllerName).Observe(dur.Seconds())
-		logger.WithField("elapsed", dur).Info("reconcile complete")
-	}()
+	recobsrv := hivemetrics.NewReconcileObserver(ControllerName, logger)
+	defer recobsrv.ObserveControllerReconcileTime()
 
 	// Fetch the MachinePool instance
 	pool := &hivev1.MachinePool{}
@@ -195,8 +219,7 @@ func (r *ReconcileRemoteMachineSet) Reconcile(request reconcile.Request) (reconc
 		return reconcile.Result{}, err
 	}
 
-	if cd.Annotations[constants.SyncsetPauseAnnotation] == "true" {
-		logger.Warn(constants.SyncsetPauseAnnotation, " is present, hence syncing to cluster is disabled")
+	if !controllerutils.ShouldSyncCluster(cd, logger) {
 		return reconcile.Result{}, nil
 	}
 
@@ -225,28 +248,29 @@ func (r *ReconcileRemoteMachineSet) Reconcile(request reconcile.Request) (reconc
 		return reconcile.Result{}, err
 	}
 
-	remoteClientBuilder := r.remoteClusterAPIClientBuilder(cd)
-
-	// If the cluster is unreachable, do not reconcile.
-	if remoteClientBuilder.Unreachable() {
-		logger.Debug("skipping cluster with unreachable condition")
-		return reconcile.Result{}, nil
-	}
-
-	remoteClusterAPIClient, err := remoteClientBuilder.Build()
-	if err != nil {
-		logger.WithError(err).Error("error building remote cluster-api client connection")
-		return reconcile.Result{}, err
+	remoteClusterAPIClient, unreachable, requeue := remoteclient.ConnectToRemoteCluster(
+		cd,
+		r.remoteClusterAPIClientBuilder(cd),
+		r.Client,
+		logger,
+	)
+	if unreachable {
+		return reconcile.Result{Requeue: requeue}, nil
 	}
 
 	logger.Info("reconciling machine pool for cluster deployment")
 
-	remoteMachineSets, err := r.getRemoteMachineSets(cd, remoteClusterAPIClient, logger)
+	masterMachine, err := r.getMasterMachine(cd, remoteClusterAPIClient, logger)
 	if err != nil {
 		return reconcile.Result{}, err
 	}
 
-	generatedMachineSets, proceed, err := r.generateMachineSets(pool, cd, remoteMachineSets, logger)
+	remoteMachineSets, err := r.getRemoteMachineSets(remoteClusterAPIClient, logger)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	generatedMachineSets, proceed, err := r.generateMachineSets(pool, cd, masterMachine, remoteMachineSets, logger)
 	if err != nil {
 		return reconcile.Result{}, err
 	} else if !proceed {
@@ -280,8 +304,35 @@ func (r *ReconcileRemoteMachineSet) Reconcile(request reconcile.Request) (reconc
 	return reconcile.Result{}, r.updatePoolStatusForMachineSets(pool, machineSets, logger)
 }
 
-func (r *ReconcileRemoteMachineSet) getRemoteMachineSets(
+func (r *ReconcileRemoteMachineSet) getMasterMachine(
 	cd *hivev1.ClusterDeployment,
+	remoteClusterAPIClient client.Client,
+	logger log.FieldLogger,
+) (*machineapi.Machine, error) {
+	remoteMachines := &machineapi.MachineList{}
+	tm := metav1.TypeMeta{}
+	tm.SetGroupVersionKind(machineapi.SchemeGroupVersion.WithKind("Machine"))
+	if err := remoteClusterAPIClient.List(
+		context.Background(),
+		remoteMachines,
+		&client.ListOptions{
+			Raw: &metav1.ListOptions{
+				TypeMeta:      tm,
+				LabelSelector: masterMachineLabelSelector,
+			},
+		},
+	); err != nil {
+		logger.WithError(err).Error("unable to fetch master machines")
+		return nil, err
+	}
+	if len(remoteMachines.Items) == 0 {
+		logger.Error("no master machines in cluster")
+		return nil, errors.New("no master machines in cluster")
+	}
+	return &remoteMachines.Items[0], nil
+}
+
+func (r *ReconcileRemoteMachineSet) getRemoteMachineSets(
 	remoteClusterAPIClient client.Client,
 	logger log.FieldLogger,
 ) (*machineapi.MachineSetList, error) {
@@ -291,7 +342,7 @@ func (r *ReconcileRemoteMachineSet) getRemoteMachineSets(
 	if err := remoteClusterAPIClient.List(
 		context.Background(),
 		remoteMachineSets,
-		client.UseListOptions(&client.ListOptions{Raw: &metav1.ListOptions{TypeMeta: tm}}),
+		&client.ListOptions{Raw: &metav1.ListOptions{TypeMeta: tm}},
 	); err != nil {
 		logger.WithError(err).Error("unable to fetch remote machine sets")
 		return nil, err
@@ -303,6 +354,7 @@ func (r *ReconcileRemoteMachineSet) getRemoteMachineSets(
 func (r *ReconcileRemoteMachineSet) generateMachineSets(
 	pool *hivev1.MachinePool,
 	cd *hivev1.ClusterDeployment,
+	masterMachine *machineapi.Machine,
 	remoteMachineSets *machineapi.MachineSetList,
 	logger log.FieldLogger,
 ) ([]*machineapi.MachineSet, bool, error) {
@@ -310,7 +362,7 @@ func (r *ReconcileRemoteMachineSet) generateMachineSets(
 		return nil, true, nil
 	}
 
-	actuator, err := r.actuatorBuilder(cd, remoteMachineSets.Items, logger)
+	actuator, err := r.actuatorBuilder(cd, pool, masterMachine, remoteMachineSets.Items, logger)
 	if err != nil {
 		logger.WithError(err).Error("unable to create actuator")
 		return nil, false, err
@@ -332,9 +384,11 @@ func (r *ReconcileRemoteMachineSet) generateMachineSets(
 		}
 
 		if ms.Labels == nil {
-			ms.Labels = map[string]string{}
+			ms.Labels = make(map[string]string, 2)
 		}
 		ms.Labels[machinePoolNameLabel] = pool.Spec.Name
+		// Add the managed-by-Hive label:
+		ms.Labels[constants.HiveManagedLabel] = "true"
 
 		// Apply hive MachinePool labels to MachineSet MachineSpec.
 		ms.Spec.Template.Spec.ObjectMeta.Labels = make(map[string]string, len(pool.Spec.Labels))
@@ -558,7 +612,7 @@ func (r *ReconcileRemoteMachineSet) syncMachineAutoscalers(
 	if err := remoteClusterAPIClient.List(
 		context.Background(),
 		remoteMachineAutoscalers,
-		client.UseListOptions(&client.ListOptions{Raw: &metav1.ListOptions{TypeMeta: tm}}),
+		&client.ListOptions{Raw: &metav1.ListOptions{TypeMeta: tm}},
 	); err != nil {
 		logger.WithError(err).Error("unable to fetch remote machine autoscalers")
 		return err
@@ -690,7 +744,7 @@ func (r *ReconcileRemoteMachineSet) syncClusterAutoscaler(
 	if err := remoteClusterAPIClient.List(
 		context.Background(),
 		remoteClusterAutoscalers,
-		client.UseListOptions(&client.ListOptions{Raw: &metav1.ListOptions{TypeMeta: tm}}),
+		&client.ListOptions{Raw: &metav1.ListOptions{TypeMeta: tm}},
 	); err != nil {
 		logger.WithError(err).Error("unable to fetch remote cluster autoscalers")
 		return err
@@ -769,7 +823,13 @@ func (r *ReconcileRemoteMachineSet) updatePoolStatusForMachineSets(
 	return errors.Wrap(r.Status().Update(context.Background(), pool), "failed to update pool status")
 }
 
-func (r *ReconcileRemoteMachineSet) createActuator(cd *hivev1.ClusterDeployment, remoteMachineSets []machineapi.MachineSet, logger log.FieldLogger) (Actuator, error) {
+func (r *ReconcileRemoteMachineSet) createActuator(
+	cd *hivev1.ClusterDeployment,
+	pool *hivev1.MachinePool,
+	masterMachine *machineapi.Machine,
+	remoteMachineSets []machineapi.MachineSet,
+	logger log.FieldLogger,
+) (Actuator, error) {
 	switch {
 	case cd.Spec.Platform.AWS != nil:
 		creds := &corev1.Secret{}
@@ -783,7 +843,7 @@ func (r *ReconcileRemoteMachineSet) createActuator(cd *hivev1.ClusterDeployment,
 		); err != nil {
 			return nil, err
 		}
-		return NewAWSActuator(creds, cd.Spec.Platform.AWS.Region, remoteMachineSets, r.scheme, logger)
+		return NewAWSActuator(r.Client, creds, cd.Spec.Platform.AWS.Region, pool, masterMachine, r.scheme, logger)
 	case cd.Spec.Platform.GCP != nil:
 		creds := &corev1.Secret{}
 		if err := r.Get(
@@ -796,7 +856,11 @@ func (r *ReconcileRemoteMachineSet) createActuator(cd *hivev1.ClusterDeployment,
 		); err != nil {
 			return nil, err
 		}
-		return NewGCPActuator(r.Client, creds, r.scheme, r.expectations, logger)
+		clusterVersion, err := getClusterVersion(cd)
+		if err != nil {
+			return nil, err
+		}
+		return NewGCPActuator(r.Client, creds, clusterVersion, masterMachine, remoteMachineSets, r.scheme, r.expectations, logger)
 	case cd.Spec.Platform.Azure != nil:
 		creds := &corev1.Secret{}
 		if err := r.Get(
@@ -810,6 +874,12 @@ func (r *ReconcileRemoteMachineSet) createActuator(cd *hivev1.ClusterDeployment,
 			return nil, err
 		}
 		return NewAzureActuator(creds, logger)
+	case cd.Spec.Platform.OpenStack != nil:
+		return NewOpenStackActuator(masterMachine, r.scheme, logger)
+	case cd.Spec.Platform.VSphere != nil:
+		return NewVSphereActuator(masterMachine, r.scheme, logger)
+	case cd.Spec.Platform.Ovirt != nil:
+		return NewOvirtActuator(masterMachine, r.scheme, logger)
 	default:
 		return nil, errors.New("unsupported platform")
 	}
@@ -854,4 +924,12 @@ func getMinMaxReplicasForMachineSet(pool *hivev1.MachinePool, machineSets []*mac
 		max = min
 	}
 	return
+}
+
+func getClusterVersion(cd *hivev1.ClusterDeployment) (string, error) {
+	version, versionPresent := cd.Labels[constants.VersionMajorMinorPatchLabel]
+	if !versionPresent {
+		return "", errors.New("cluster version not set in clusterdeployment")
+	}
+	return version, nil
 }

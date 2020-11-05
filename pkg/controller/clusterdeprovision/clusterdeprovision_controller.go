@@ -6,17 +6,17 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
-
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	k8slabels "k8s.io/kubernetes/pkg/util/labels"
+	"k8s.io/client-go/util/flowcontrol"
+	"k8s.io/client-go/util/workqueue"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -32,11 +32,14 @@ import (
 	hivemetrics "github.com/openshift/hive/pkg/controller/metrics"
 	controllerutils "github.com/openshift/hive/pkg/controller/utils"
 	"github.com/openshift/hive/pkg/install"
+	k8slabels "github.com/openshift/hive/pkg/util/labels"
 )
 
 const (
-	controllerName    = "clusterDeprovision"
-	jobHashAnnotation = "hive.openshift.io/jobhash"
+	ControllerName                = hivev1.ClusterDeprovisionControllerName
+	jobHashAnnotation             = "hive.openshift.io/jobhash"
+	authenticationFailedReason    = "AuthenticationFailed"
+	authenticationSucceededReason = "AuthenticationSucceeded"
 )
 
 var (
@@ -47,7 +50,18 @@ var (
 			Buckets: []float64{60, 300, 600, 1200, 1800, 2400, 3000, 3600},
 		},
 	)
+
+	// actuators is a list of available actuators for this controller
+	// It is populated via the registerActuator function
+	actuators []Actuator
 )
+
+// registerActuator registers an actuator with this controller. The actuator
+// determines whether it can handle a particular cluster deployment via the CanHandle
+// function.
+func registerActuator(a Actuator) {
+	actuators = append(actuators, a)
+}
 
 func init() {
 	metrics.Registry.MustRegister(metricUninstallJobDuration)
@@ -56,15 +70,21 @@ func init() {
 // Add creates a new ClusterDeprovision Controller and adds it to the Manager with default RBAC. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func Add(mgr manager.Manager) error {
-	r, err := newReconciler(mgr)
+	logger := log.WithField("controller", ControllerName)
+	concurrentReconciles, clientRateLimiter, queueRateLimiter, err := controllerutils.GetControllerConfig(mgr.GetClient(), ControllerName)
+	if err != nil {
+		logger.WithError(err).Error("could not get controller configurations")
+		return err
+	}
+	r, err := newReconciler(mgr, clientRateLimiter)
 	if err != nil {
 		return err
 	}
-	return add(mgr, r)
+	return add(mgr, r, concurrentReconciles, queueRateLimiter)
 }
 
 // newReconciler returns a new reconcile.Reconciler
-func newReconciler(mgr manager.Manager) (reconcile.Reconciler, error) {
+func newReconciler(mgr manager.Manager, rateLimiter flowcontrol.RateLimiter) (reconcile.Reconciler, error) {
 	deprovisionsDisabled := false
 	if val, ok := os.LookupEnv(constants.DeprovisionsDisabledEnvVar); ok {
 		var err error
@@ -76,25 +96,29 @@ func newReconciler(mgr manager.Manager) (reconcile.Reconciler, error) {
 		}
 	}
 	return &ReconcileClusterDeprovision{
-		Client:               controllerutils.NewClientWithMetricsOrDie(mgr, controllerName),
+		Client:               controllerutils.NewClientWithMetricsOrDie(mgr, ControllerName, &rateLimiter),
 		scheme:               mgr.GetScheme(),
 		deprovisionsDisabled: deprovisionsDisabled,
 	}, nil
 }
 
 // add adds a new Controller to mgr with r as the reconcile.Reconciler
-func add(mgr manager.Manager, r reconcile.Reconciler) error {
+func add(mgr manager.Manager, r reconcile.Reconciler, concurrentReconciles int, rateLimiter workqueue.RateLimiter) error {
 	// Create a new controller
-	c, err := controller.New("clusterdeprovision-controller", mgr, controller.Options{Reconciler: r})
+	c, err := controller.New("clusterdeprovision-controller", mgr, controller.Options{
+		Reconciler:              r,
+		MaxConcurrentReconciles: concurrentReconciles,
+		RateLimiter:             rateLimiter,
+	})
 	if err != nil {
-		log.WithField("controller", controllerName).WithError(err).Error("Error getting new clusterdeprovision-controller")
+		log.WithField("controller", ControllerName).WithError(err).Error("Error getting new clusterdeprovision-controller")
 		return err
 	}
 
 	// Watch for changes to ClusterDeprovision
 	err = c.Watch(&source.Kind{Type: &hivev1.ClusterDeprovision{}}, &handler.EnqueueRequestForObject{})
 	if err != nil {
-		log.WithField("controller", controllerName).WithError(err).Error("Error watching changes to clusterdeprovision")
+		log.WithField("controller", ControllerName).WithError(err).Error("Error watching changes to clusterdeprovision")
 		return err
 	}
 
@@ -104,7 +128,7 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 		OwnerType:    &hivev1.ClusterDeprovision{},
 	})
 	if err != nil {
-		log.WithField("controller", controllerName).WithError(err).Error("Error watching  uninstall jobs created for clusterdeprovisionreques")
+		log.WithField("controller", ControllerName).WithError(err).Error("Error watching  uninstall jobs created for clusterdeprovisionreques")
 		return err
 	}
 
@@ -123,18 +147,12 @@ type ReconcileClusterDeprovision struct {
 // Reconcile reads that state of the cluster for a ClusterDeprovision object and makes changes based on the state read
 // and what is in the ClusterDeprovision.Spec
 func (r *ReconcileClusterDeprovision) Reconcile(request reconcile.Request) (reconcile.Result, error) {
-	start := time.Now()
-	rLog := log.WithFields(log.Fields{
-		"name":       request.NamespacedName.String(),
-		"controller": controllerName,
-	})
+	rLog := controllerutils.BuildControllerLogger(ControllerName, "clusterDeprovision", request.NamespacedName)
 	// For logging, we need to see when the reconciliation loop starts and ends.
 	rLog.Info("reconciling cluster deprovision request")
-	defer func() {
-		dur := time.Since(start)
-		hivemetrics.MetricControllerReconcileTime.WithLabelValues(controllerName).Observe(dur.Seconds())
-		rLog.WithField("elapsed", dur).Info("reconcile complete")
-	}()
+	recobsrv := hivemetrics.NewReconcileObserver(ControllerName, rLog)
+	defer recobsrv.ObserveControllerReconcileTime()
+
 	// Fetch the ClusterDeprovision instance
 	instance := &hivev1.ClusterDeprovision{}
 	err := r.Get(context.TODO(), request.NamespacedName, instance)
@@ -147,6 +165,13 @@ func (r *ReconcileClusterDeprovision) Reconcile(request reconcile.Request) (reco
 		}
 		// Error reading the object - requeue the request.
 		rLog.WithError(err).Error("cannot get clusterdeprovision")
+		return reconcile.Result{}, err
+	}
+
+	// Ensure owner references are correctly set
+	err = controllerutils.ReconcileOwnerReferences(instance, generateOwnershipUniqueKeys(instance), r, r.scheme, rLog)
+	if err != nil {
+		rLog.WithError(err).Error("Error reconciling object ownership")
 		return reconcile.Result{}, err
 	}
 
@@ -183,11 +208,61 @@ func (r *ReconcileClusterDeprovision) Reconcile(request reconcile.Request) (reco
 		rLog.Error("ClusterDeprovision created for ClusterDeployment that has not been deleted")
 		return reconcile.Result{}, nil
 	}
+	if controllerutils.IsDeleteProtected(cd) {
+		rLog.Error("deprovision blocked for ClusterDeployment with protected delete on")
+		return reconcile.Result{}, nil
+	}
 
 	// Check if deprovisions are currently disabled: (originates in HiveConfig in real world)
 	if r.deprovisionsDisabled {
 		rLog.Warn("deprovisions are currently disabled in HiveConfig, skipping")
 		return reconcile.Result{}, nil
+	}
+
+	actuator := r.getActuator(instance)
+	if actuator == nil {
+		rLog.Debug("No actuator found for this provider")
+	} else {
+		// actuator found, ensure creds work.
+		err := actuator.TestCredentials(instance, r.Client, rLog)
+		if err != nil {
+			rLog.WithError(err).Warn("Credential check failed")
+
+			conditions, changed := controllerutils.SetClusterDeprovisionConditionWithChangeCheck(
+				instance.Status.Conditions,
+				hivev1.AuthenticationFailureClusterDeprovisionCondition,
+				corev1.ConditionTrue,
+				authenticationFailedReason,
+				"Credential check failed",
+				controllerutils.UpdateConditionIfReasonOrMessageChange,
+			)
+
+			if changed {
+				instance.Status.Conditions = conditions
+				if updateErr := r.Status().Update(context.Background(), instance); updateErr != nil {
+					return reconcile.Result{}, updateErr
+				}
+			}
+
+			return reconcile.Result{}, err
+		}
+
+		// Authentication succeeded. Make sure that's noted in status.
+		conditions, changed := controllerutils.SetClusterDeprovisionConditionWithChangeCheck(
+			instance.Status.Conditions,
+			hivev1.AuthenticationFailureClusterDeprovisionCondition,
+			corev1.ConditionFalse,
+			authenticationSucceededReason,
+			"Credential check succeeded",
+			controllerutils.UpdateConditionIfReasonOrMessageChange,
+		)
+
+		if changed {
+			instance.Status.Conditions = conditions
+			if err := r.Status().Update(context.Background(), instance); err != nil {
+				return reconcile.Result{}, err
+			}
+		}
 	}
 
 	// Generate an uninstall job
@@ -276,4 +351,26 @@ func (r *ReconcileClusterDeprovision) Reconcile(request reconcile.Request) (reco
 
 	rLog.Infof("uninstall job not yet successful")
 	return reconcile.Result{}, nil
+}
+
+func generateOwnershipUniqueKeys(owner hivev1.MetaRuntimeObject) []*controllerutils.OwnershipUniqueKey {
+	return []*controllerutils.OwnershipUniqueKey{
+		{
+			TypeToList: &batchv1.JobList{},
+			LabelSelector: map[string]string{
+				constants.ClusterDeprovisionNameLabel: owner.GetName(),
+				constants.JobTypeLabel:                constants.JobTypeDeprovision,
+			},
+			Controlled: true,
+		},
+	}
+}
+
+func (r *ReconcileClusterDeprovision) getActuator(cd *hivev1.ClusterDeprovision) Actuator {
+	for _, a := range actuators {
+		if a.CanHandle(cd) {
+			return a
+		}
+	}
+	return nil
 }

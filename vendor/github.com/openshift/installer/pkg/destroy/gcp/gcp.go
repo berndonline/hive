@@ -51,6 +51,7 @@ type ClusterUninstaller struct {
 	// from metadata or by inferring it from existing cluster resources.
 	cloudControllerUID string
 
+	errorTracker
 	requestIDTracker
 	pendingItemTracker
 }
@@ -163,29 +164,13 @@ func (o *ClusterUninstaller) destroyCluster() (bool, error) {
 
 // getZoneName extracts a zone name from a zone URL of the form:
 // https://www.googleapis.com/compute/v1/projects/project-id/zones/us-central1-a
-// Trimming the URL, leaves a string like: project-id/zones/us-central1-a
-// TODO: Find a better way to get the zone name to account for changes in base path
+// Splitting the URL with the delimiter `/projects`, leaves a string like: project-id/zones/us-central1-a
 func (o *ClusterUninstaller) getZoneName(zoneURL string) string {
-	path := strings.TrimLeft(zoneURL, "https://www.googleapis.com/compute/v1/projects/")
-	parts := strings.Split(path, "/")
-	if len(parts) >= 3 {
-		return parts[2]
+	parts := strings.Split(zoneURL, "/")
+	if len(parts) > 1 {
+		return parts[len(parts)-1]
 	}
 	return ""
-}
-
-func (o *ClusterUninstaller) areAllClusterInstances(instances []cloudResource) bool {
-	for _, instance := range instances {
-		if !o.isClusterResource(instance.name) {
-			return false
-		}
-	}
-	return true
-}
-
-// TODO: Find a better way to get the instance group URL to account for changes in base path
-func (o *ClusterUninstaller) getInstanceGroupURL(ig cloudResource) string {
-	return fmt.Sprintf("%s%s/zones/%s/instanceGroups/%s", "https://www.googleapis.com/compute/v1/projects/", o.ProjectID, ig.zone, ig.name)
 }
 
 func (o *ClusterUninstaller) isClusterResource(name string) bool {
@@ -206,14 +191,6 @@ func isNoOp(err error) bool {
 	}
 	ae, ok := err.(*googleapi.Error)
 	return ok && (ae.Code == http.StatusNotFound || ae.Code == http.StatusNotModified)
-}
-
-func isNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	ae, ok := err.(*googleapi.Error)
-	return ok && ae.Code == http.StatusNotFound
 }
 
 // aggregateError is a utility function that takes a slice of errors and an
@@ -262,9 +239,7 @@ func (t requestIDTracker) requestID(identifier ...string) string {
 // sent.
 func (t requestIDTracker) resetRequestID(identifier ...string) {
 	key := strings.Join(identifier, "/")
-	if _, exists := t.requestIDs[key]; exists {
-		delete(t.requestIDs, key)
-	}
+	delete(t.requestIDs, key)
 }
 
 // pendingItemTracker tracks a set of pending item names for a given type of resource
@@ -276,6 +251,17 @@ func newPendingItemTracker() pendingItemTracker {
 	return pendingItemTracker{
 		pendingItems: map[string]cloudResources{},
 	}
+}
+
+// GetAllPendintItems returns a slice of all of the pending items across all types.
+func (t pendingItemTracker) GetAllPendingItems() []cloudResource {
+	var items []cloudResource
+	for _, is := range t.pendingItems {
+		for _, i := range is {
+			items = append(items, i)
+		}
+	}
+	return items
 }
 
 // getPendingItems returns the list of resources to be deleted.

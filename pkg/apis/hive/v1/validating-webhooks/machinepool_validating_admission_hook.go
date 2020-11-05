@@ -2,10 +2,9 @@ package validatingwebhooks
 
 import (
 	"fmt"
+	"net/http"
 
 	log "github.com/sirupsen/logrus"
-
-	"net/http"
 
 	admissionv1beta1 "k8s.io/api/admission/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -14,14 +13,17 @@ import (
 	metavalidation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
 	hivev1aws "github.com/openshift/hive/pkg/apis/hive/v1/aws"
 	hivev1azure "github.com/openshift/hive/pkg/apis/hive/v1/azure"
 	hivev1gcp "github.com/openshift/hive/pkg/apis/hive/v1/gcp"
+	hivev1openstack "github.com/openshift/hive/pkg/apis/hive/v1/openstack"
+	hivev1ovirt "github.com/openshift/hive/pkg/apis/hive/v1/ovirt"
+	hivev1vsphere "github.com/openshift/hive/pkg/apis/hive/v1/vsphere"
 )
 
 const (
@@ -31,11 +33,17 @@ const (
 
 	defaultMasterPoolName = "master"
 	defaultWorkerPoolName = "worker"
+	legacyWorkerPoolName  = "w"
 )
 
 // MachinePoolValidatingAdmissionHook is a struct that is used to reference what code should be run by the generic-admission-server.
 type MachinePoolValidatingAdmissionHook struct {
-	decoder runtime.Decoder
+	decoder *admission.Decoder
+}
+
+// NewMachinePoolValidatingAdmissionHook constructs a new MachinePoolValidatingAdmissionHook
+func NewMachinePoolValidatingAdmissionHook(decoder *admission.Decoder) *MachinePoolValidatingAdmissionHook {
+	return &MachinePoolValidatingAdmissionHook{decoder: decoder}
 }
 
 // ValidatingResource is called by generic-admission-server on startup to register the returned REST resource through which the
@@ -64,10 +72,6 @@ func (a *MachinePoolValidatingAdmissionHook) Initialize(kubeClientConfig *rest.C
 		"version":  "v1",
 		"resource": "machinepoolvalidator",
 	}).Info("Initializing validation REST resource")
-
-	scheme := runtime.NewScheme()
-	hivev1.AddToScheme(scheme)
-	a.decoder = serializer.NewCodecFactory(scheme).UniversalDecoder(hivev1.SchemeGroupVersion)
 
 	return nil // No initialization needed right now.
 }
@@ -136,7 +140,7 @@ func (a *MachinePoolValidatingAdmissionHook) shouldValidate(request *admissionv1
 func (a *MachinePoolValidatingAdmissionHook) validateCreateRequest(request *admissionv1beta1.AdmissionRequest, logger log.FieldLogger) *admissionv1beta1.AdmissionResponse {
 	logger = logger.WithField("method", "validateCreateRequest")
 
-	newObject, resp := a.decode(&request.Object, logger.WithField("decode", "Object"))
+	newObject, resp := a.decode(request.Object, logger.WithField("decode", "Object"))
 	if resp != nil {
 		return resp
 	}
@@ -165,7 +169,7 @@ func (a *MachinePoolValidatingAdmissionHook) validateCreateRequest(request *admi
 func (a *MachinePoolValidatingAdmissionHook) validateUpdateRequest(request *admissionv1beta1.AdmissionRequest, logger log.FieldLogger) *admissionv1beta1.AdmissionResponse {
 	logger = logger.WithField("method", "validateUpdateRequest")
 
-	newObject, resp := a.decode(&request.Object, logger.WithField("decode", "Object"))
+	newObject, resp := a.decode(request.Object, logger.WithField("decode", "Object"))
 	if resp != nil {
 		return resp
 	}
@@ -174,7 +178,7 @@ func (a *MachinePoolValidatingAdmissionHook) validateUpdateRequest(request *admi
 		WithField("object.Name", newObject.Name).
 		WithField("object.Namespace", newObject.Namespace)
 
-	oldObject, resp := a.decode(&request.OldObject, logger.WithField("decode", "OldObject"))
+	oldObject, resp := a.decode(request.OldObject, logger.WithField("decode", "OldObject"))
 	if resp != nil {
 		return resp
 	}
@@ -195,9 +199,9 @@ func (a *MachinePoolValidatingAdmissionHook) validateUpdateRequest(request *admi
 	}
 }
 
-func (a *MachinePoolValidatingAdmissionHook) decode(raw *runtime.RawExtension, logger log.FieldLogger) (*hivev1.MachinePool, *admissionv1beta1.AdmissionResponse) {
+func (a *MachinePoolValidatingAdmissionHook) decode(raw runtime.RawExtension, logger log.FieldLogger) (*hivev1.MachinePool, *admissionv1beta1.AdmissionResponse) {
 	obj := &hivev1.MachinePool{}
-	if _, _, err := a.decoder.Decode(raw.Raw, nil, obj); err != nil {
+	if err := a.decoder.DecodeRaw(raw, obj); err != nil {
 		logger.WithError(err).Error("failed to decode")
 		return nil, &admissionv1beta1.AdmissionResponse{
 			Allowed: false,
@@ -231,8 +235,10 @@ func validateMachinePoolName(pool *hivev1.MachinePool) field.ErrorList {
 	if pool.Name != fmt.Sprintf("%s-%s", pool.Spec.ClusterDeploymentRef.Name, pool.Spec.Name) {
 		allErrs = append(allErrs, field.Invalid(field.NewPath("metadata", "name"), pool.Name, "name must be ${CD_NAME}-${POOL_NAME}, where ${CD_NAME} is the name of the clusterdeployment and ${POOL_NAME} is the name of the remote machine pool"))
 	}
-	if pool.Spec.Name == defaultMasterPoolName {
-		allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "name"), pool.Spec.Name, fmt.Sprintf("pool name cannot be %q", defaultMasterPoolName)))
+	for _, invalidName := range []string{defaultMasterPoolName, legacyWorkerPoolName} {
+		if pool.Spec.Name == invalidName {
+			allErrs = append(allErrs, field.Invalid(field.NewPath("spec", "name"), pool.Spec.Name, fmt.Sprintf("pool name cannot be %q", invalidName)))
+		}
 	}
 	return allErrs
 }
@@ -268,16 +274,29 @@ func validateMachinePoolSpecInvariants(spec *hivev1.MachinePoolSpec, fldPath *fi
 		allErrs = append(allErrs, validateAWSMachinePoolPlatformInvariants(p, platformPath.Child("aws"))...)
 		numberOfMachineSets = len(p.Zones)
 	}
-	if p := spec.Platform.GCP; p != nil {
-		platforms = append(platforms, "gcp")
-		allErrs = append(allErrs, validateGCPMachinePoolPlatformInvariants(p, platformPath.Child("gcp"))...)
-		numberOfMachineSets = len(p.Zones)
-	}
 	if p := spec.Platform.Azure; p != nil {
 		platforms = append(platforms, "azure")
 		allErrs = append(allErrs, validateAzureMachinePoolPlatformInvariants(p, platformPath.Child("azure"))...)
 		numberOfMachineSets = len(p.Zones)
 	}
+	if p := spec.Platform.GCP; p != nil {
+		platforms = append(platforms, "gcp")
+		allErrs = append(allErrs, validateGCPMachinePoolPlatformInvariants(p, platformPath.Child("gcp"))...)
+		numberOfMachineSets = len(p.Zones)
+	}
+	if p := spec.Platform.OpenStack; p != nil {
+		platforms = append(platforms, "openstack")
+		allErrs = append(allErrs, validateOpenStackMachinePoolPlatformInvariants(p, platformPath.Child("openstack"))...)
+	}
+	if p := spec.Platform.VSphere; p != nil {
+		platforms = append(platforms, "vsphere")
+		allErrs = append(allErrs, validateVSphereMachinePoolPlatformInvariants(p, platformPath.Child("vsphere"))...)
+	}
+	if p := spec.Platform.Ovirt; p != nil {
+		platforms = append(platforms, "ovirt")
+		allErrs = append(allErrs, validateOvirtMachinePoolPlatformInvariants(p, platformPath.Child("ovirt"))...)
+	}
+
 	switch len(platforms) {
 	case 0:
 		allErrs = append(allErrs, field.Required(platformPath, "must specify a platform"))
@@ -357,5 +376,39 @@ func validateAzureMachinePoolPlatformInvariants(platform *hivev1azure.MachinePoo
 	if osDisk.DiskSizeGB <= 0 {
 		allErrs = append(allErrs, field.Invalid(osDiskPath.Child("iops"), osDisk.DiskSizeGB, "disk size must be positive"))
 	}
+	return allErrs
+}
+
+func validateOpenStackMachinePoolPlatformInvariants(platform *hivev1openstack.MachinePool, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+	if platform.Flavor == "" {
+		allErrs = append(allErrs, field.Required(fldPath.Child("type"), "flavor name is required"))
+	}
+	return allErrs
+}
+
+func validateVSphereMachinePoolPlatformInvariants(platform *hivev1vsphere.MachinePool, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+	if platform.NumCPUs <= 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("numCPUs"), "number of cpus must be positive"))
+	}
+
+	if platform.NumCoresPerSocket <= 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("numCoresPerSocket"), "number of cores per socket must be positive"))
+	}
+
+	if platform.MemoryMiB <= 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("memoryMiB"), "memory must be positive"))
+	}
+
+	if platform.OSDisk.DiskSizeGB <= 0 {
+		allErrs = append(allErrs, field.Required(fldPath.Child("diskSizeGB"), "disk size must be positive"))
+	}
+
+	return allErrs
+}
+
+func validateOvirtMachinePoolPlatformInvariants(platform *hivev1ovirt.MachinePool, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
 	return allErrs
 }

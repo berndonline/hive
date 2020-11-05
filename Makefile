@@ -1,18 +1,52 @@
-BINDIR = bin
-SRC_DIRS = pkg contrib
-GOFILES = $(shell find $(SRC_DIRS) -name '*.go' | grep -v bindata | grep -v generated)
-VERIFY_IMPORTS_CONFIG = build/verify-imports/import-rules.yaml
+.PHONY: all
+all: vendor update test build
 
-# To use docker build, specify BUILD_CMD="docker build"
-BUILD_CMD ?= imagebuilder
+# Force build-machinery-go to grab an earlier version of controller-gen. The newer version adds annotations on pod
+# specs that will cause the CRDs to fail validation. The fix for that requires the CRDs to use v1, but we still need
+# to support users that are running kube versions that only have v1beta1.
+CONTROLLER_GEN_VERSION ?=v0.2.1-37-ga3cca5d
+
+# Include the library makefile
+include $(addprefix ./vendor/github.com/openshift/build-machinery-go/make/, \
+	golang.mk \
+	lib/tmp.mk \
+	targets/openshift/controller-gen.mk \
+	targets/openshift/yq.mk \
+	targets/openshift/bindata.mk \
+	targets/openshift/deps.mk \
+	targets/openshift/images.mk \
+)
 
 DOCKER_CMD ?= docker
+
+# Namespace hive-operator will run:
+HIVE_OPERATOR_NS ?= hive
+
+# Namespace hive-controllers/hiveadmission/etc will run:
+HIVE_NS ?= hive
+
+# Log level that should be used when running hive from source, or with make deploy.
+LOG_LEVEL ?= debug
 
 # Image URL to use all building/pushing image targets
 IMG ?= hive-controller:latest
 
 # Image to use when deploying
 DEPLOY_IMAGE ?= registry.svc.ci.openshift.org/openshift/hive-v4.0:hive
+
+GO_PACKAGES :=$(addsuffix ...,$(addprefix ./,$(filter-out vendor/,$(wildcard */))))
+GO_BUILD_PACKAGES :=./cmd/... ./contrib/cmd/hiveutil
+GO_BUILD_BINDIR :=bin
+# Exclude e2e tests from unit testing
+GO_TEST_PACKAGES :=./pkg/... ./cmd/... ./contrib/...
+
+ifeq "$(GO_MOD_FLAGS)" "-mod=vendor"
+	ifeq "$(GOFLAGS)" ""
+		GOFLAGS_FOR_GENERATE ?= GOFLAGS=-mod=vendor
+	else
+		GOFLAGS_FOR_GENERATE ?= GOFLAGS=-mod=vendor,$(GOFLAGS)
+	endif
+endif
 
 # Look up distro name (e.g. Fedora)
 DISTRO ?= $(shell if which lsb_release &> /dev/null; then lsb_release -si; else echo "Unknown"; fi)
@@ -24,29 +58,52 @@ else # Other distros like RHEL 7 and CentOS 7 currently need sudo.
 	SUDO_CMD = sudo
 endif
 
-# set the cache directory to an accessible location
-ifeq ($(XDG_CACHE_HOME),)
-	export XDG_CACHE_HOME:=/tmp
-endif
+BINDATA_INPUTS :=./config/hiveadmission/... ./config/controllers/... ./config/rbac/... ./config/configmaps/...
+$(call add-bindata,operator,$(BINDATA_INPUTS),,assets,pkg/operator/assets/bindata.go)
 
-.PHONY: default
-default: all
+$(call build-image,hive,$(IMG),./Dockerfile,.)
+$(call build-image,hive-dev,$(IMG),./Dockerfile.dev,.)
+$(call build-image,hive-build,"hive-build:latest",./build/build-image/Dockerfile,.)
 
-.PHONY: all
-all: fmt vet generate verify test build
+clean:
+	rm -rf $(GO_BUILD_BINDIR)
 
 .PHONY: vendor
 vendor:
-	dep ensure -v
+	go mod tidy
+	go mod vendor
 
-# Run tests
-.PHONY: test
-test: generate fmt vet crd lint
-	go test ./pkg/... ./cmd/... ./contrib/... -coverprofile cover.out
+# Update the manifest directory of artifacts OLM will deploy. Copies files in from
+# the locations kubebuilder generates them.
+.PHONY: manifests
+manifests: crd
+
+# controller-gen is adding a yaml break (---) at the beginning of each file. OLM does not like this break.
+# We use yq to strip out the yaml break by having yq replace each file with yq's formatting.
+# This also removes the spec.validation.openAPIV3Schema.type field which OpenShift 3.11 does not like.
+# $1 - CRD file
+define strip-yaml-break
+	@$(YQ) d -i $(1) spec.validation.openAPIV3Schema.type
+
+endef
+
+# Generate CRD yaml from our api types:
+.PHONY: crd
+crd: ensure-controller-gen ensure-yq
+	rm -rf ./config/crds
+	'$(CONTROLLER_GEN)' crd paths=./pkg/apis/hive/v1 paths=./pkg/apis/hiveinternal/v1alpha1 output:dir=./config/crds
+	@echo Stripping yaml breaks from CRD files
+	$(foreach p,$(wildcard ./config/crds/*.yaml),$(call strip-yaml-break,$(p)))
+update: crd
+
+.PHONY: verify-crd
+verify-crd: ensure-controller-gen ensure-yq
+	./hack/verify-crd.sh
+verify: verify-crd
 
 .PHONY: test-integration
 test-integration: generate
-	go test ./test/integration/...
+	go test $(GO_MOD_FLAGS) ./test/integration/...
 
 .PHONY: test-e2e
 test-e2e:
@@ -54,179 +111,126 @@ test-e2e:
 
 .PHONY: test-e2e-postdeploy
 test-e2e-postdeploy:
-	go test -timeout 0 -count=1 ./test/e2e/postdeploy/...
+	go test $(GO_MOD_FLAGS) -v -timeout 0 -count=1 ./test/e2e/postdeploy/...
 
 .PHONY: test-e2e-postinstall
 test-e2e-postinstall:
-	go test -timeout 0 -count=1 ./test/e2e/postinstall/...
+	go test $(GO_MOD_FLAGS) -v -timeout 0 -count=1 ./test/e2e/postinstall/...
 
-# Builds all of hive's binaries (including utils).
-.PHONY: build
-build: manager hiveutil hiveadmission operator hive-apiserver
+.PHONY: test-e2e-destroycluster
+test-e2e-destroycluster:
+	go test $(GO_MOD_FLAGS) -v -timeout 0 -count=1 ./test/e2e/destroycluster/...
 
+.PHONY: test-e2e-uninstallhive
+test-e2e-uninstallhive:
+	go test $(GO_MOD_FLAGS) -v -timeout 0 -count=1 ./test/e2e/uninstallhive/...
 
-# Build manager binary
-.PHONY: manager
-manager: generate
-	go build -o bin/manager github.com/openshift/hive/cmd/manager
+# Run against the configured cluster in ~/.kube/config
+run: build
+	./bin/manager --log-level=${LOG_LEVEL}
 
-.PHONY: operator
-operator: generate
-	go build -o bin/hive-operator github.com/openshift/hive/cmd/operator
-
-# Build hiveutil binary
-.PHONY: hiveutil
-hiveutil: generate
-	go build -o bin/hiveutil github.com/openshift/hive/contrib/cmd/hiveutil
-
-# Build hiveadmission binary
-.PHONY: hiveadmission
-hiveadmission:
-	go build -o bin/hiveadmission github.com/openshift/hive/cmd/hiveadmission
-
-# Build v1alpha1 aggregated API server
-.PHONY: hive-apiserver
-hive-apiserver:
-	go build -o bin/hive-apiserver github.com/openshift/hive/cmd/hive-apiserver
-
-# Run against the configured Kubernetes cluster in ~/.kube/config
-.PHONY: run
-run: generate fmt vet
-	go run ./cmd/manager/main.go --log-level=debug
-
-# Run against the configured Kubernetes cluster in ~/.kube/config
-.PHONY: run-operator
-run-operator: generate fmt vet
-	go run ./cmd/operator/main.go --log-level=debug
+# Run against the configured cluster in ~/.kube/config
+run-operator: build
+	./bin/operator --log-level=${LOG_LEVEL}
 
 # Install CRDs into a cluster
-.PHONY: install
 install: crd
 	oc apply -f config/crds
 
 # Deploy controller in the configured Kubernetes cluster in ~/.kube/config
 .PHONY: deploy
-deploy: manifests install generate
+deploy: install
 	# Deploy the operator manifests:
+	oc create namespace ${HIVE_OPERATOR_NS} || true
 	mkdir -p overlays/deploy
 	cp overlays/template/kustomization.yaml overlays/deploy
-	cd overlays/deploy && kustomize edit set image registry.svc.ci.openshift.org/openshift/hive-v4.0:hive=${DEPLOY_IMAGE}
+	cd overlays/deploy && kustomize edit set image registry.svc.ci.openshift.org/openshift/hive-v4.0:hive=${DEPLOY_IMAGE} && kustomize edit set namespace ${HIVE_OPERATOR_NS}
 	kustomize build overlays/deploy | oc apply -f -
 	rm -rf overlays/deploy
+	# Create a default basic HiveConfig so the operator will deploy Hive
+	oc process --local=true -p HIVE_NS=${HIVE_NS} -p LOG_LEVEL=${LOG_LEVEL} -f config/templates/hiveconfig.yaml | oc apply -f -
 
-# Update the manifest directory of artifacts OLM will deploy. Copies files in from
-# the locations kubebuilder generates them.
-.PHONY: manifests
-manifests: crd
+verify-codegen:
+	bash -x hack/verify-codegen.sh
+verify: verify-codegen
 
-# Generate CRD yaml from our api types:
-.PHONY: crd
-crd:
-	# The apis-path is explicitly specified so that CRDs are not created for v1alpha1
-	go run tools/vendor/sigs.k8s.io/controller-tools/cmd/controller-gen/main.go crd --apis-path=pkg/apis/hive/v1
-
-# Run go fmt against code
-.PHONY: fmt
-fmt:
-	gofmt -w -s $(SRC_DIRS)
-
-# Run go vet against code
-.PHONY: vet
-vet:
-	go vet ./pkg/... ./cmd/... ./contrib/...
-
-# Run verification tests
-.PHONY: verify
-verify: verify-generated verify-imports verify-gofmt verify-lint verify-go-vet
+update-codegen:
+	hack/update-codegen.sh
+update: update-codegen
 
 # Check import naming
 .PHONY: verify-imports
-verify-imports: hiveutil
+verify-imports: build
 	@echo "Verifying import naming"
 	@sh -c \
 	  'for file in $(GOFILES) ; do \
 	     $(BINDIR)/hiveutil verify-imports -c $(VERIFY_IMPORTS_CONFIG) $$file || exit 1 ; \
 	   done'
+verify: verify-imports
 
-# Check import naming
+# Check lint
 .PHONY: verify-lint
-verify-lint:
+verify-lint: install-tools
 	@echo Verifying golint
 	@sh -c \
 	  'for file in $(GOFILES) ; do \
-	     if [[ $$file == "pkg/api/validation"* ]]; then continue; fi; \
-	     if [[ $$file == "pkg/hive/apis/hive/hiveconfig_types.go" ]]; then continue; fi; \
-	     if [[ $$file == "pkg/hive/apis/hive/hiveconversion/"* ]]; then continue; fi; \
-	     if [[ $$file == "pkg/hive/apiserver/registry/"* ]]; then continue; fi; \
 	     golint --set_exit_status $$file || exit 1 ; \
 	   done'
-
-.PHONY: verify-gofmt
-verify-gofmt:
-	@echo Verifying gofmt
-	@gofmt -l -s $(SRC_DIRS)>.out 2>&1 || true
-	@[ ! -s .out ] || \
-	  (echo && echo "*** Please run 'make fmt' in order to fix the following:" && \
-	  cat .out && echo && rm .out && false)
-	@rm .out
-
-.PHONY: verify-go-vet
-verify-go-vet: generate
-	@echo Verifying go vet
-	@go vet ./cmd/... ./contrib/... $(go list ./pkg/... | grep -v _generated)
-
-.PHONY: verify-generated
-verify-generated:
-	hack/verify-generated.sh
+verify: verify-lint
 
 # Generate code
 .PHONY: generate
-generate:
-	go generate ./pkg/... ./cmd/...
-	hack/update-bindata.sh
+generate: install-tools
+	$(GOFLAGS_FOR_GENERATE) go generate ./pkg/... ./cmd/...
+update: generate
 
-# Build the docker image
+# Build the image using docker
 .PHONY: docker-build
 docker-build:
-	$(BUILD_CMD) -t ${IMG} .
+	@echo "*** DEPRECATED: Use the image-hive target instead ***"
+	$(DOCKER_CMD) build -t ${IMG} .
 
-# Build the docker image
-.PHONY: docker-dev-push
-docker-dev-push: build
+# Build the dev image using docker
+.PHONY: docker-dev-build
+docker-dev-build: build
+	@echo "*** DEPRECATED: Use the image-hive-dev target instead ***"
 	$(DOCKER_CMD) build -t ${IMG} -f Dockerfile.dev .
-	$(DOCKER_CMD) push ${IMG}
 
-# Push the docker image
+# Build the dev image using builah
+.PHONY: buildah-dev-build
+buildah-dev-build:
+	buildah bud -f Dockerfile --tag ${IMG}
+
+# Push the image using docker
 .PHONY: docker-push
 docker-push:
 	$(DOCKER_CMD) push ${IMG}
 
-# Build the image with buildah
-.PHONY: buildah-build
-buildah-build:
-	$(SUDO_CMD) buildah bud --tag ${IMG} .
+# Build and push the dev image
+.PHONY: docker-dev-push
+docker-dev-push: build image-hive-dev docker-push
 
-# Build the code locally and build+push an image with the local binaries rather than doing a full in-container compile.
+# Build and push the dev image with buildah
 .PHONY: buildah-dev-push
-buildah-dev-push: build
-	$(SUDO_CMD) buildah bud -f Dockerfile.dev --tag ${IMG} .
-	$(SUDO_CMD) buildah push ${IMG}
+buildah-dev-push: buildah-dev-build
+	buildah push --tls-verify=false ${IMG}
 
-# Push the buildah image
+# Push the image using buildah
 .PHONY: buildah-push
-buildah-push: buildah-build
+buildah-push:
+	$(SUDO_CMD) buildah pull ${IMG}
 	$(SUDO_CMD) buildah push ${IMG}
-
-.PHONY: clean ## Remove all build artifacts
-clean:
-	rm -rf $(BINDIR)
 
 # Run golangci-lint against code
 # TODO replace verify (except verify-generated), vet, fmt targets with lint as it covers all of it
 .PHONY: lint
-lint:
+lint: install-tools
 	golangci-lint run -c ./golangci.yml ./pkg/... ./cmd/... ./contrib/...
+# Remove the golangci-lint from the verify until a fix is in place for permisions for writing to the /.cache directory.
+#verify: lint
 
-# Build the build image so that it can be used locally for performing builds.
-build-build-image: build/build-image/Dockerfile
-	$(BUILD_CMD) -t "hive-build:latest" -f build/build-image/Dockerfile .
+.PHONY: install-tools
+install-tools:
+	go install $(GO_MOD_FLAGS) github.com/golang/mock/mockgen
+	go install $(GO_MOD_FLAGS) golang.org/x/lint/golint
+	go install $(GO_MOD_FLAGS) github.com/golangci/golangci-lint/cmd/golangci-lint

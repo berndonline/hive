@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	controllerutils "github.com/openshift/hive/pkg/controller/utils"
 	"reflect"
 	"testing"
+
+	controllerutils "github.com/openshift/hive/pkg/controller/utils"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/golang/mock/gomock"
@@ -19,7 +20,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/pointer"
-	awsprovider "sigs.k8s.io/cluster-api-provider-aws/pkg/apis/awsproviderconfig/v1beta1"
+	awsproviderapis "sigs.k8s.io/cluster-api-provider-aws/pkg/apis"
+	awsprovider "sigs.k8s.io/cluster-api-provider-aws/pkg/apis/awsprovider/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -56,7 +58,7 @@ func init() {
 func TestRemoteMachineSetReconcile(t *testing.T) {
 	apis.AddToScheme(scheme.Scheme)
 	machineapi.SchemeBuilder.AddToScheme(scheme.Scheme)
-	awsprovider.SchemeBuilder.AddToScheme(scheme.Scheme)
+	awsproviderapis.AddToScheme(scheme.Scheme)
 
 	getPool := func(c client.Client, poolName string) *hivev1.MachinePool {
 		pool := &hivev1.MachinePool{}
@@ -71,9 +73,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 		rMSL := &machineapi.MachineSetList{}
 		tm := metav1.TypeMeta{}
 		tm.SetGroupVersionKind(machineapi.SchemeGroupVersion.WithKind("MachineSet"))
-		err := rc.List(context.TODO(), rMSL, client.UseListOptions(&client.ListOptions{
-			Raw: &metav1.ListOptions{TypeMeta: tm},
-		}))
+		err := rc.List(context.TODO(), rMSL, &client.ListOptions{Raw: &metav1.ListOptions{TypeMeta: tm}})
 		if err == nil {
 			return rMSL, err
 		}
@@ -85,9 +85,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 		rMAL := &autoscalingv1beta1.MachineAutoscalerList{}
 		tm := metav1.TypeMeta{}
 		tm.SetGroupVersionKind(autoscalingv1beta1.SchemeGroupVersion.WithKind("MachineAutoscaler"))
-		err := rc.List(context.TODO(), rMAL, client.UseListOptions(&client.ListOptions{
-			Raw: &metav1.ListOptions{TypeMeta: tm},
-		}))
+		err := rc.List(context.TODO(), rMAL, &client.ListOptions{Raw: &metav1.ListOptions{TypeMeta: tm}})
 		if err == nil {
 			return rMAL, err
 		}
@@ -99,9 +97,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 		rCAL := &autoscalingv1.ClusterAutoscalerList{}
 		tm := metav1.TypeMeta{}
 		tm.SetGroupVersionKind(autoscalingv1.SchemeGroupVersion.WithKind("ClusterAutoscaler"))
-		err := rc.List(context.TODO(), rCAL, client.UseListOptions(&client.ListOptions{
-			Raw: &metav1.ListOptions{TypeMeta: tm},
-		}))
+		err := rc.List(context.TODO(), rCAL, &client.ListOptions{Raw: &metav1.ListOptions{TypeMeta: tm}})
 		if err == nil {
 			return rCAL, err
 		}
@@ -114,7 +110,6 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 		machinePool                      *hivev1.MachinePool
 		remoteExisting                   []runtime.Object
 		generatedMachineSets             []*machineapi.MachineSet
-		unreachable                      bool
 		actuatorDoNotProceed             bool
 		expectErr                        bool
 		expectNoFinalizer                bool
@@ -136,6 +131,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			clusterDeployment: testClusterDeployment(),
 			machinePool:       testMachinePool(),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
@@ -157,6 +153,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			machinePool:          testMachinePool(),
 			actuatorDoNotProceed: true,
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
@@ -177,6 +174,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			clusterDeployment: testClusterDeployment(),
 			machinePool:       testMachinePool(),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 0, 0),
@@ -197,6 +195,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			clusterDeployment: testClusterDeployment(),
 			machinePool:       testMachinePool(),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 			},
@@ -222,16 +221,21 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			machinePool: testMachinePool(),
 		},
 		{
-			name:              "Skip create missing machine set when cluster is unreachable",
-			clusterDeployment: testClusterDeployment(),
-			machinePool:       testMachinePool(),
-			unreachable:       true,
+			name: "Skip create missing machine set when cluster is unreachable",
+			clusterDeployment: func() *hivev1.ClusterDeployment {
+				cd := testClusterDeployment()
+				cond := controllerutils.FindClusterDeploymentCondition(cd.Status.Conditions, hivev1.UnreachableCondition)
+				cond.Status = corev1.ConditionTrue
+				return cd
+			}(),
+			machinePool: testMachinePool(),
 		},
 		{
 			name:              "Delete extra machine set",
 			clusterDeployment: testClusterDeployment(),
 			machinePool:       testMachinePool(),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
@@ -253,6 +257,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			clusterDeployment: testClusterDeployment(),
 			machinePool:       testMachinePool(),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 3, 0),
 				testMachineSet("foo-12345-other-us-east-1b", "other", true, 3, 0),
 			},
@@ -269,6 +274,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			clusterDeployment: testClusterDeployment(),
 			machinePool:       testMachinePool(),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-other-us-east-1a", "other", true, 1, 0),
 				testMachineSet("foo-12345-other-us-east-1b", "other", true, 1, 0),
 				testMachineSet("foo-12345-other-us-east-1c", "other", true, 1, 0),
@@ -297,6 +303,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 				return mp
 			}(),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-other-us-east-1a", "other", true, 1, 0),
 				testMachineSet("foo-12345-other-us-east-1b", "other", true, 1, 0),
 				testMachineSet("foo-12345-other-us-east-1c", "other", true, 1, 0),
@@ -315,6 +322,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			name:        "No cluster deployment",
 			machinePool: testMachinePool(),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
@@ -336,6 +344,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			}(),
 			machinePool: testMachinePool(),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
@@ -352,13 +361,14 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			clusterDeployment: testClusterDeployment(),
 			machinePool:       testAutoscalingMachinePool(3, 5),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
-				testClusterAutoscaler(),
-				testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 2),
-				testMachineAutoscaler("foo-12345-worker-us-east-1b", 1, 2),
-				testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
+				testClusterAutoscaler("3"),
+				testMachineAutoscaler("foo-12345-worker-us-east-1a", "1", 1, 2),
+				testMachineAutoscaler("foo-12345-worker-us-east-1b", "1", 1, 2),
+				testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
 			},
 			generatedMachineSets: []*machineapi.MachineSet{
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", false, 1, 0),
@@ -371,12 +381,12 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
 			},
 			expectedRemoteMachineAutoscalers: []autoscalingv1beta1.MachineAutoscaler{
-				*testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1b", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1a", "1", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1b", "1", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
 			},
 			expectedRemoteClusterAutoscalers: []autoscalingv1.ClusterAutoscaler{
-				*testClusterAutoscaler(),
+				*testClusterAutoscaler("3"),
 			},
 		},
 		{
@@ -384,12 +394,13 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			clusterDeployment: testClusterDeployment(),
 			machinePool:       testAutoscalingMachinePool(3, 5),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
-				testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 2),
-				testMachineAutoscaler("foo-12345-worker-us-east-1b", 1, 2),
-				testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
+				testMachineAutoscaler("foo-12345-worker-us-east-1a", "1", 1, 2),
+				testMachineAutoscaler("foo-12345-worker-us-east-1b", "1", 1, 2),
+				testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
 			},
 			generatedMachineSets: []*machineapi.MachineSet{
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", false, 1, 0),
@@ -402,12 +413,12 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
 			},
 			expectedRemoteMachineAutoscalers: []autoscalingv1beta1.MachineAutoscaler{
-				*testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1b", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1a", "1", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1b", "1", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
 			},
 			expectedRemoteClusterAutoscalers: []autoscalingv1.ClusterAutoscaler{
-				*testClusterAutoscaler(),
+				*testClusterAutoscaler("1"),
 			},
 		},
 		{
@@ -415,17 +426,18 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			clusterDeployment: testClusterDeployment(),
 			machinePool:       testAutoscalingMachinePool(3, 5),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
 				func() runtime.Object {
-					a := testClusterAutoscaler()
+					a := testClusterAutoscaler("1")
 					a.Spec.ScaleDown = nil
 					return a
 				}(),
-				testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 2),
-				testMachineAutoscaler("foo-12345-worker-us-east-1b", 1, 2),
-				testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
+				testMachineAutoscaler("foo-12345-worker-us-east-1a", "1", 1, 2),
+				testMachineAutoscaler("foo-12345-worker-us-east-1b", "1", 1, 2),
+				testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
 			},
 			generatedMachineSets: []*machineapi.MachineSet{
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", false, 1, 0),
@@ -438,12 +450,12 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
 			},
 			expectedRemoteMachineAutoscalers: []autoscalingv1beta1.MachineAutoscaler{
-				*testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1b", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1a", "1", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1b", "1", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
 			},
 			expectedRemoteClusterAutoscalers: []autoscalingv1.ClusterAutoscaler{
-				*testClusterAutoscaler(),
+				*testClusterAutoscaler("2"),
 			},
 		},
 		{
@@ -451,17 +463,18 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			clusterDeployment: testClusterDeployment(),
 			machinePool:       testAutoscalingMachinePool(3, 5),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
 				func() runtime.Object {
-					a := testClusterAutoscaler()
+					a := testClusterAutoscaler("1")
 					a.Spec.ScaleDown.Enabled = false
 					return a
 				}(),
-				testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 2),
-				testMachineAutoscaler("foo-12345-worker-us-east-1b", 1, 2),
-				testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
+				testMachineAutoscaler("foo-12345-worker-us-east-1a", "1", 1, 2),
+				testMachineAutoscaler("foo-12345-worker-us-east-1b", "1", 1, 2),
+				testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
 			},
 			generatedMachineSets: []*machineapi.MachineSet{
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", false, 1, 0),
@@ -474,12 +487,12 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
 			},
 			expectedRemoteMachineAutoscalers: []autoscalingv1beta1.MachineAutoscaler{
-				*testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1b", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1a", "1", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1b", "1", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
 			},
 			expectedRemoteClusterAutoscalers: []autoscalingv1.ClusterAutoscaler{
-				*testClusterAutoscaler(),
+				*testClusterAutoscaler("2"),
 			},
 		},
 		{
@@ -487,10 +500,11 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			clusterDeployment: testClusterDeployment(),
 			machinePool:       testAutoscalingMachinePool(3, 5),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
-				testClusterAutoscaler(),
+				testClusterAutoscaler("1"),
 			},
 			generatedMachineSets: []*machineapi.MachineSet{
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", false, 1, 0),
@@ -503,12 +517,12 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
 			},
 			expectedRemoteMachineAutoscalers: []autoscalingv1beta1.MachineAutoscaler{
-				*testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1b", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1a", "1", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1b", "1", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
 			},
 			expectedRemoteClusterAutoscalers: []autoscalingv1.ClusterAutoscaler{
-				*testClusterAutoscaler(),
+				*testClusterAutoscaler("1"),
 			},
 		},
 		{
@@ -516,13 +530,14 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			clusterDeployment: testClusterDeployment(),
 			machinePool:       testAutoscalingMachinePool(3, 5),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
-				testClusterAutoscaler(),
-				testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 1),
-				testMachineAutoscaler("foo-12345-worker-us-east-1b", 2, 2),
-				testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
+				testClusterAutoscaler("1"),
+				testMachineAutoscaler("foo-12345-worker-us-east-1a", "1", 1, 1),
+				testMachineAutoscaler("foo-12345-worker-us-east-1b", "1", 2, 2),
+				testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
 			},
 			generatedMachineSets: []*machineapi.MachineSet{
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", false, 1, 0),
@@ -535,12 +550,12 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
 			},
 			expectedRemoteMachineAutoscalers: []autoscalingv1beta1.MachineAutoscaler{
-				*testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1b", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1a", "2", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1b", "2", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
 			},
 			expectedRemoteClusterAutoscalers: []autoscalingv1.ClusterAutoscaler{
-				*testClusterAutoscaler(),
+				*testClusterAutoscaler("1"),
 			},
 		},
 		{
@@ -548,14 +563,15 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			clusterDeployment: testClusterDeployment(),
 			machinePool:       testAutoscalingMachinePool(3, 5),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
-				testClusterAutoscaler(),
-				testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 2),
-				testMachineAutoscaler("foo-12345-worker-us-east-1b", 1, 2),
-				testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
-				testMachineAutoscaler("foo-12345-worker-us-east-1d", 1, 1),
+				testClusterAutoscaler("1"),
+				testMachineAutoscaler("foo-12345-worker-us-east-1a", "1", 1, 2),
+				testMachineAutoscaler("foo-12345-worker-us-east-1b", "1", 1, 2),
+				testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
+				testMachineAutoscaler("foo-12345-worker-us-east-1d", "1", 1, 1),
 			},
 			generatedMachineSets: []*machineapi.MachineSet{
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", false, 1, 0),
@@ -568,12 +584,12 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
 			},
 			expectedRemoteMachineAutoscalers: []autoscalingv1beta1.MachineAutoscaler{
-				*testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1b", 1, 2),
-				*testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1a", "1", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1b", "1", 1, 2),
+				*testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
 			},
 			expectedRemoteClusterAutoscalers: []autoscalingv1.ClusterAutoscaler{
-				*testClusterAutoscaler(),
+				*testClusterAutoscaler("1"),
 			},
 		},
 		{
@@ -586,17 +602,18 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 				return mp
 			}(),
 			remoteExisting: []runtime.Object{
+				testMachine("master1", "master"),
 				testMachineSet("foo-12345-worker-us-east-1a", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1b", "worker", true, 1, 0),
 				testMachineSet("foo-12345-worker-us-east-1c", "worker", true, 1, 0),
-				testClusterAutoscaler(),
-				testMachineAutoscaler("foo-12345-worker-us-east-1a", 1, 2),
-				testMachineAutoscaler("foo-12345-worker-us-east-1b", 1, 2),
-				testMachineAutoscaler("foo-12345-worker-us-east-1c", 1, 1),
+				testClusterAutoscaler("1"),
+				testMachineAutoscaler("foo-12345-worker-us-east-1a", "1", 1, 2),
+				testMachineAutoscaler("foo-12345-worker-us-east-1b", "1", 1, 2),
+				testMachineAutoscaler("foo-12345-worker-us-east-1c", "1", 1, 1),
 			},
 			expectNoFinalizer: true,
 			expectedRemoteClusterAutoscalers: []autoscalingv1.ClusterAutoscaler{
-				*testClusterAutoscaler(),
+				*testClusterAutoscaler("1"),
 			},
 		},
 	}
@@ -628,7 +645,6 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 			}
 
 			mockRemoteClientBuilder := remoteclientmock.NewMockBuilder(mockCtrl)
-			mockRemoteClientBuilder.EXPECT().Unreachable().Return(test.unreachable).AnyTimes()
 			mockRemoteClientBuilder.EXPECT().Build().Return(remoteFakeClient, nil).AnyTimes()
 
 			logger := log.WithField("controller", "remotemachineset")
@@ -639,7 +655,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 				scheme:                        scheme.Scheme,
 				logger:                        logger,
 				remoteClusterAPIClientBuilder: func(*hivev1.ClusterDeployment) remoteclient.Builder { return mockRemoteClientBuilder },
-				actuatorBuilder: func(cd *hivev1.ClusterDeployment, remoteMachineSets []machineapi.MachineSet, cdLog log.FieldLogger) (Actuator, error) {
+				actuatorBuilder: func(cd *hivev1.ClusterDeployment, pool *hivev1.MachinePool, masterMachine *machineapi.Machine, remoteMachineSets []machineapi.MachineSet, cdLog log.FieldLogger) (Actuator, error) {
 					return mockActuator, nil
 				},
 				expectations: controllerExpectations,
@@ -684,7 +700,7 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 								t.Errorf("machineset %v has unexpected labels:\nexpected: %v\nactual: %v", eMS.Name, eMS.Labels, rMS.Labels)
 							}
 							if !reflect.DeepEqual(eMS.ObjectMeta.Annotations, rMS.ObjectMeta.Annotations) {
-								t.Errorf("machineset %v has unexpected annotations:\nexpected: %v\nactual: %v", eMS.Name, eMS.Labels, rMS.Labels)
+								t.Errorf("machineset %v has unexpected annotations:\nexpected: %v\nactual: %v", eMS.Name, eMS.Annotations, rMS.Annotations)
 							}
 							if !reflect.DeepEqual(eMS.Spec.Template.Spec.Labels, rMS.Spec.Template.Spec.Labels) {
 								t.Errorf("machineset %v machinespec has unexpected labels:\nexpected: %v\nactual: %v", eMS.Name, eMS.Spec.Template.Spec.Labels, rMS.Spec.Template.Spec.Labels)
@@ -736,6 +752,10 @@ func TestRemoteMachineSetReconcile(t *testing.T) {
 
 func testMachinePool() *hivev1.MachinePool {
 	return &hivev1.MachinePool{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: hivev1.SchemeGroupVersion.String(),
+			Kind:       "MachinePool",
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:  testNamespace,
 			Name:       fmt.Sprintf("%s-%s", testName, testPoolName),
@@ -778,9 +798,8 @@ func testAutoscalingMachinePool(min, max int) *hivev1.MachinePool {
 	return p
 }
 
-func testMachineSet(name string, machineType string, unstompedAnnotation bool, replicas int, generation int) *machineapi.MachineSet {
-	msReplicas := int32(replicas)
-	awsProviderSpec := &awsprovider.AWSMachineProviderConfig{
+func testAWSProviderSpec() *awsprovider.AWSMachineProviderConfig {
+	return &awsprovider.AWSMachineProviderConfig{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "AWSMachineProviderConfig",
 			APIVersion: awsprovider.SchemeGroupVersion.String(),
@@ -789,11 +808,46 @@ func testMachineSet(name string, machineType string, unstompedAnnotation bool, r
 			ID: aws.String(testAMI),
 		},
 	}
-	rawAWSProviderSpec, err := encodeAWSMachineProviderSpec(awsProviderSpec, scheme.Scheme)
+}
+
+func testMachineSpec(machineType string) machineapi.MachineSpec {
+	rawAWSProviderSpec, err := encodeAWSMachineProviderSpec(testAWSProviderSpec(), scheme.Scheme)
 	if err != nil {
 		log.WithError(err).Fatal("error encoding AWS machine provider spec")
 	}
+	return machineapi.MachineSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				"machine.openshift.io/cluster-api-cluster":      testInfraID,
+				"machine.openshift.io/cluster-api-machine-role": machineType,
+				"machine.openshift.io/cluster-api-machine-type": machineType,
+			},
+		},
+		ProviderSpec: machineapi.ProviderSpec{
+			Value: rawAWSProviderSpec,
+		},
 
+		Taints: []corev1.Taint{
+			{
+				Key:    "foo",
+				Value:  "bar",
+				Effect: corev1.TaintEffectNoSchedule,
+			},
+		},
+	}
+}
+
+func testMachine(name string, machineType string) *machineapi.Machine {
+	return &machineapi.Machine{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Spec: testMachineSpec(machineType),
+	}
+}
+
+func testMachineSet(name string, machineType string, unstompedAnnotation bool, replicas int, generation int) *machineapi.MachineSet {
+	msReplicas := int32(replicas)
 	ms := machineapi.MachineSet{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: machineapi.SchemeGroupVersion.String(),
@@ -805,32 +859,14 @@ func testMachineSet(name string, machineType string, unstompedAnnotation bool, r
 			Labels: map[string]string{
 				machinePoolNameLabel:                       machineType,
 				"machine.openshift.io/cluster-api-cluster": testInfraID,
+				constants.HiveManagedLabel:                 "true",
 			},
 			Generation: int64(generation),
 		},
 		Spec: machineapi.MachineSetSpec{
 			Replicas: &msReplicas,
 			Template: machineapi.MachineTemplateSpec{
-				Spec: machineapi.MachineSpec{
-					ObjectMeta: metav1.ObjectMeta{
-						Labels: map[string]string{
-							"machine.openshift.io/cluster-api-cluster":      testInfraID,
-							"machine.openshift.io/cluster-api-machine-role": machineType,
-							"machine.openshift.io/cluster-api-machine-type": machineType,
-						},
-					},
-					ProviderSpec: machineapi.ProviderSpec{
-						Value: rawAWSProviderSpec,
-					},
-
-					Taints: []corev1.Taint{
-						{
-							Key:    "foo",
-							Value:  "bar",
-							Effect: corev1.TaintEffectNoSchedule,
-						},
-					},
-				},
+				Spec: testMachineSpec(machineType),
 			},
 		},
 	}
@@ -843,11 +879,12 @@ func testMachineSet(name string, machineType string, unstompedAnnotation bool, r
 	return &ms
 }
 
-func testMachineAutoscaler(name string, min, max int) *autoscalingv1beta1.MachineAutoscaler {
+func testMachineAutoscaler(name string, resourceVersion string, min, max int) *autoscalingv1beta1.MachineAutoscaler {
 	return &autoscalingv1beta1.MachineAutoscaler{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "openshift-machine-api",
-			Name:      name,
+			Namespace:       "openshift-machine-api",
+			Name:            name,
+			ResourceVersion: resourceVersion,
 			Labels: map[string]string{
 				machinePoolNameLabel: "worker",
 			},
@@ -864,10 +901,11 @@ func testMachineAutoscaler(name string, min, max int) *autoscalingv1beta1.Machin
 	}
 }
 
-func testClusterAutoscaler() *autoscalingv1.ClusterAutoscaler {
+func testClusterAutoscaler(resourceVersion string) *autoscalingv1.ClusterAutoscaler {
 	return &autoscalingv1.ClusterAutoscaler{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "default",
+			Name:            "default",
+			ResourceVersion: resourceVersion,
 		},
 		Spec: autoscalingv1.ClusterAutoscalerSpec{
 			ScaleDown: &autoscalingv1.ScaleDownConfig{
@@ -879,11 +917,18 @@ func testClusterAutoscaler() *autoscalingv1.ClusterAutoscaler {
 
 func testClusterDeployment() *hivev1.ClusterDeployment {
 	return &hivev1.ClusterDeployment{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: hivev1.SchemeGroupVersion.String(),
+			Kind:       "ClusterDeployment",
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       testName,
 			Namespace:  testNamespace,
 			Finalizers: []string{hivev1.FinalizerDeprovision},
 			UID:        types.UID("1234"),
+			Labels: map[string]string{
+				constants.VersionMajorMinorPatchLabel: "4.4.0",
+			},
 		},
 		Spec: hivev1.ClusterDeploymentSpec{
 			ClusterName: testName,
@@ -902,6 +947,12 @@ func testClusterDeployment() *hivev1.ClusterDeployment {
 			},
 			Installed: true,
 		},
+		Status: hivev1.ClusterDeploymentStatus{
+			Conditions: []hivev1.ClusterDeploymentCondition{{
+				Type:   hivev1.UnreachableCondition,
+				Status: corev1.ConditionFalse,
+			}},
+		},
 	}
 }
 
@@ -911,4 +962,12 @@ func printAWSMachineProviderConfig(cfg *awsprovider.AWSMachineProviderConfig) st
 		panic(err.Error())
 	}
 	return string(b)
+}
+
+func withClusterVersion(cd *hivev1.ClusterDeployment, version string) *hivev1.ClusterDeployment {
+	if cd.Labels == nil {
+		cd.Labels = make(map[string]string, 1)
+	}
+	cd.Labels[constants.VersionMajorMinorPatchLabel] = version
+	return cd
 }

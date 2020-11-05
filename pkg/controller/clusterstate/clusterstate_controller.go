@@ -8,11 +8,13 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	k8slabels "github.com/openshift/hive/pkg/util/labels"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
-	k8slabels "k8s.io/kubernetes/pkg/util/labels"
+	"k8s.io/client-go/util/flowcontrol"
+	"k8s.io/client-go/util/workqueue"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -23,6 +25,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	configv1 "github.com/openshift/api/config/v1"
+
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
 	"github.com/openshift/hive/pkg/constants"
 	hivemetrics "github.com/openshift/hive/pkg/controller/metrics"
@@ -31,41 +34,51 @@ import (
 )
 
 const (
-	controllerName       = "clusterState"
+	ControllerName       = hivev1.ClusterStateControllerName
 	statusUpdateInterval = 10 * time.Minute
 )
 
 // Add creates a new ClusterState controller and adds it to the manager with default RBAC.
 func Add(mgr manager.Manager) error {
-	return AddToManager(mgr, NewReconciler(mgr))
+	logger := log.WithField("controller", ControllerName)
+	concurrentReconciles, clientRateLimiter, queueRateLimiter, err := controllerutils.GetControllerConfig(mgr.GetClient(), ControllerName)
+	if err != nil {
+		logger.WithError(err).Error("could not get controller configurations")
+		return err
+	}
+	return AddToManager(mgr, NewReconciler(mgr, clientRateLimiter), concurrentReconciles, queueRateLimiter)
 }
 
 // NewReconciler returns a new reconcile.Reconciler
-func NewReconciler(mgr manager.Manager) reconcile.Reconciler {
+func NewReconciler(mgr manager.Manager, rateLimiter flowcontrol.RateLimiter) reconcile.Reconciler {
 	r := &ReconcileClusterState{
-		Client:       controllerutils.NewClientWithMetricsOrDie(mgr, controllerName),
+		Client:       controllerutils.NewClientWithMetricsOrDie(mgr, ControllerName, &rateLimiter),
 		scheme:       mgr.GetScheme(),
-		logger:       log.WithField("controller", controllerName),
+		logger:       log.WithField("controller", ControllerName),
 		updateStatus: updateClusterStateStatus,
 	}
 	r.remoteClusterAPIClientBuilder = func(cd *hivev1.ClusterDeployment) remoteclient.Builder {
-		return remoteclient.NewBuilder(r.Client, cd, controllerName)
+		return remoteclient.NewBuilder(r.Client, cd, ControllerName)
 	}
 	return r
 }
 
 // AddToManager adds a new Controller to mgr with r as the reconcile.Reconciler
-func AddToManager(mgr manager.Manager, r reconcile.Reconciler) error {
-	c, err := controller.New("clusterstate-controller", mgr, controller.Options{Reconciler: r, MaxConcurrentReconciles: controllerutils.GetConcurrentReconciles()})
+func AddToManager(mgr manager.Manager, r reconcile.Reconciler, concurrentReconciles int, rateLimiter workqueue.RateLimiter) error {
+	c, err := controller.New("clusterstate-controller", mgr, controller.Options{
+		Reconciler:              r,
+		MaxConcurrentReconciles: concurrentReconciles,
+		RateLimiter:             rateLimiter,
+	})
 	if err != nil {
-		log.WithField("controller", controllerName).WithError(err).Error("Error creating new clusterstate controller")
+		log.WithField("controller", ControllerName).WithError(err).Error("Error creating new clusterstate controller")
 		return err
 	}
 
 	// Watch for changes to ClusterDeployment
 	err = c.Watch(&source.Kind{Type: &hivev1.ClusterDeployment{}}, &handler.EnqueueRequestForObject{})
 	if err != nil {
-		log.WithField("controller", controllerName).WithError(err).Error("Error watching cluster deployment")
+		log.WithField("controller", ControllerName).WithError(err).Error("Error watching cluster deployment")
 		return err
 	}
 	return nil
@@ -88,19 +101,10 @@ type ReconcileClusterState struct {
 
 // Reconcile ensures that a given ClusterState resource exists and reflects the state of cluster operators from its target cluster
 func (r *ReconcileClusterState) Reconcile(request reconcile.Request) (reconcile.Result, error) {
-	start := time.Now()
-	logger := r.logger.WithFields(log.Fields{
-		"controller":        controllerName,
-		"clusterDeployment": request.NamespacedName.String(),
-	})
-
-	// For logging, we need to see when the reconciliation loop starts and ends.
+	logger := controllerutils.BuildControllerLogger(ControllerName, "clusterDeployment", request.NamespacedName)
 	logger.Info("reconciling cluster deployment")
-	defer func() {
-		dur := time.Since(start)
-		hivemetrics.MetricControllerReconcileTime.WithLabelValues(controllerName).Observe(dur.Seconds())
-		logger.WithField("elapsed", dur).Info("reconcile complete")
-	}()
+	recobsrv := hivemetrics.NewReconcileObserver(ControllerName, logger)
+	defer recobsrv.ObserveControllerReconcileTime()
 
 	// Fetch the ClusterDeployment instance
 	cd := &hivev1.ClusterDeployment{}
@@ -116,6 +120,14 @@ func (r *ReconcileClusterState) Reconcile(request reconcile.Request) (reconcile.
 		logger.WithError(err).Error("Error getting cluster deployment")
 		return reconcile.Result{}, err
 	}
+
+	// Ensure owner references are correctly set
+	err = controllerutils.ReconcileOwnerReferences(cd, generateOwnershipUniqueKeys(cd), r, r.scheme, logger)
+	if err != nil {
+		logger.WithError(err).Error("Error reconciling object ownership")
+		return reconcile.Result{}, err
+	}
+
 	if !cd.DeletionTimestamp.IsZero() {
 		logger.Debug("ClusterDeployment resource has been deleted")
 		return reconcile.Result{}, nil
@@ -130,10 +142,8 @@ func (r *ReconcileClusterState) Reconcile(request reconcile.Request) (reconcile.
 		return reconcile.Result{}, nil
 	}
 
-	remoteClientBuilder := r.remoteClusterAPIClientBuilder(cd)
-
 	// If the cluster is unreachable, do not reconcile.
-	if remoteClientBuilder.Unreachable() {
+	if unreachable, _ := remoteclient.Unreachable(cd); unreachable {
 		logger.Debug("skipping cluster with unreachable condition")
 		return reconcile.Result{}, nil
 	}
@@ -178,11 +188,16 @@ func (r *ReconcileClusterState) Reconcile(request reconcile.Request) (reconcile.
 		}
 	}
 
-	remoteClient, err := remoteClientBuilder.Build()
-	if err != nil {
-		logger.WithError(err).Error("error building remote cluster client connection")
-		return reconcile.Result{}, err
+	remoteClient, unreachable, requeue := remoteclient.ConnectToRemoteCluster(
+		cd,
+		r.remoteClusterAPIClientBuilder(cd),
+		r.Client,
+		logger,
+	)
+	if unreachable {
+		return reconcile.Result{Requeue: requeue}, nil
 	}
+
 	clusterOperators := &configv1.ClusterOperatorList{}
 	err = remoteClient.List(context.TODO(), clusterOperators)
 	if err != nil {
@@ -315,4 +330,16 @@ func indexOfCondition(conditions []configv1.ClusterOperatorStatusCondition, ctyp
 
 func updateClusterStateStatus(c client.Client, cs *hivev1.ClusterState) error {
 	return c.Status().Update(context.Background(), cs)
+}
+
+func generateOwnershipUniqueKeys(owner hivev1.MetaRuntimeObject) []*controllerutils.OwnershipUniqueKey {
+	return []*controllerutils.OwnershipUniqueKey{
+		{
+			TypeToList: &hivev1.ClusterStateList{},
+			LabelSelector: map[string]string{
+				constants.ClusterDeploymentNameLabel: owner.GetName(),
+			},
+			Controlled: true,
+		},
+	}
 }

@@ -1,22 +1,22 @@
 package utils
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/flowcontrol"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
-	openshiftapiv1 "github.com/openshift/api/config/v1"
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
 )
 
@@ -27,19 +27,30 @@ var (
 	},
 		[]string{"controller", "method", "resource", "remote", "status"},
 	)
+	metricKubeClientRequestSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "hive_kube_client_request_seconds",
+		Help:    "Length of time for kubernetes client requests.",
+		Buckets: []float64{0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120},
+	},
+		[]string{"controller", "method", "resource", "remote", "status"},
+	)
 )
 
 func init() {
 	metrics.Registry.MustRegister(metricKubeClientRequests)
+	metrics.Registry.MustRegister(metricKubeClientRequestSeconds)
 }
 
 // NewClientWithMetricsOrDie creates a new controller-runtime client with a wrapper which increments
 // metrics for requests by controller name, HTTP method, URL path, and whether or not the request was
 // to a remote cluster.. The client will re-use the managers cache. This should be used in
 // all Hive controllers.
-func NewClientWithMetricsOrDie(mgr manager.Manager, ctrlrName string) client.Client {
+func NewClientWithMetricsOrDie(mgr manager.Manager, ctrlrName hivev1.ControllerName, rateLimiter *flowcontrol.RateLimiter) client.Client {
 	// Copy the rest config as we want our round trippers to be controller specific.
 	cfg := rest.CopyConfig(mgr.GetConfig())
+	if rateLimiter != nil {
+		cfg.RateLimiter = *rateLimiter
+	}
 	AddControllerMetricsTransportWrapper(cfg, ctrlrName, false)
 
 	options := client.Options{
@@ -57,13 +68,13 @@ func NewClientWithMetricsOrDie(mgr manager.Manager, ctrlrName string) client.Cli
 			ClientReader: c,
 		},
 		Writer:       c,
-		StatusClient: &hiveStatusClient{c},
+		StatusClient: c,
 	}
 }
 
 // AddControllerMetricsTransportWrapper adds a transport wrapper to the given rest config which
 // exposes metrics based on the requests being made.
-func AddControllerMetricsTransportWrapper(cfg *rest.Config, controllerName string, remote bool) {
+func AddControllerMetricsTransportWrapper(cfg *rest.Config, controllerName hivev1.ControllerName, remote bool) {
 	// If the restConfig already has a transport wrapper, wrap it.
 	if cfg.WrapTransport != nil {
 		origFunc := cfg.WrapTransport
@@ -88,12 +99,13 @@ func AddControllerMetricsTransportWrapper(cfg *rest.Config, controllerName strin
 // ControllerMetricsTripper is a RoundTripper implementation which tracks our metrics for client requests.
 type ControllerMetricsTripper struct {
 	http.RoundTripper
-	Controller string
+	Controller hivev1.ControllerName
 	Remote     bool
 }
 
 // RoundTrip implements the http RoundTripper interface.
 func (cmt *ControllerMetricsTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	startTime := time.Now()
 	remoteStr := "false"
 	if cmt.Remote {
 		remoteStr = "true"
@@ -101,8 +113,20 @@ func (cmt *ControllerMetricsTripper) RoundTrip(req *http.Request) (*http.Respons
 	path, pathErr := parsePath(req.URL.Path)
 	// Call the nested RoundTripper.
 	resp, err := cmt.RoundTripper.RoundTrip(req)
+	applyTime := metav1.Now().Sub(startTime)
 	if err == nil && pathErr == nil {
-		metricKubeClientRequests.WithLabelValues(cmt.Controller, req.Method, path, remoteStr, resp.Status).Inc()
+		metricKubeClientRequests.WithLabelValues(cmt.Controller.String(), req.Method, path, remoteStr, resp.Status).Inc()
+		metricKubeClientRequestSeconds.WithLabelValues(cmt.Controller.String(), req.Method, path, remoteStr, resp.Status).Observe(applyTime.Seconds())
+		if applyTime >= 5*time.Second {
+			log.WithFields(log.Fields{
+				"controller":    cmt.Controller.String(),
+				"method":        req.Method,
+				"path":          path,
+				"remote":        remoteStr,
+				"status":        resp.Status,
+				"elapsedMillis": applyTime.Milliseconds(), // millis for consistency with how we log controller reconcile time
+			}).Warn("slow client request")
+		}
 	}
 
 	return resp, err
@@ -133,35 +157,4 @@ func parsePath(path string) (string, error) {
 
 	}
 	return "", fmt.Errorf("unable to parse path for client metrics: %s", path)
-}
-
-// hiveStatusClient is a wrapper around a client.StatusClient that returns
-// a hiveStatusWriter wrapped around the client.StatusWriter returned by the
-// client.StatusClient.
-type hiveStatusClient struct {
-	client.StatusClient
-}
-
-// Status implements StatusClient.Status
-func (sc *hiveStatusClient) Status() client.StatusWriter {
-	return &hiveStatusWriter{sc.StatusClient.Status()}
-}
-
-// hiveStatusWriter is a wrapper around a client.StatusWrapper that massages
-// the statuses of clustedeployments so that they pass validation.
-type hiveStatusWriter struct {
-	client.StatusWriter
-}
-
-// Update implements StatusWriter.Update
-func (sw *hiveStatusWriter) Update(ctx context.Context, obj runtime.Object, opts ...client.UpdateOptionFunc) error {
-	switch t := obj.(type) {
-	case *hivev1.ClusterDeployment:
-		// Fetching clusterVersion object can result in nil clusterVersion.Status.AvailableUpdates
-		// Place an empty list if needed to satisfy the object validation.
-		if t.Status.ClusterVersionStatus.AvailableUpdates == nil {
-			t.Status.ClusterVersionStatus.AvailableUpdates = []openshiftapiv1.Update{}
-		}
-	}
-	return sw.StatusWriter.Update(ctx, obj, opts...)
 }

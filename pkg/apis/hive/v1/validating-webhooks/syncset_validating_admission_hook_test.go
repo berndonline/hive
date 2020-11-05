@@ -4,17 +4,23 @@ import (
 	"encoding/json"
 	"testing"
 
-	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
 	"github.com/stretchr/testify/assert"
+
 	admissionv1beta1 "k8s.io/api/admission/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
+)
+
+const (
+	syncSetNS = "test-namespace"
 )
 
 func TestSyncSetValidatingResource(t *testing.T) {
 	// Arrange
-	data := SyncSetValidatingAdmissionHook{}
+	data := NewSyncSetValidatingAdmissionHook(createDecoder(t))
 	expectedPlural := schema.GroupVersionResource{
 		Group:    "admission.hive.openshift.io",
 		Version:  "v1",
@@ -32,7 +38,7 @@ func TestSyncSetValidatingResource(t *testing.T) {
 
 func TestSyncSetInitialize(t *testing.T) {
 	// Arrange
-	data := SyncSetValidatingAdmissionHook{}
+	data := NewSyncSetValidatingAdmissionHook(createDecoder(t))
 
 	// Act
 	err := data.Initialize(nil, nil)
@@ -107,6 +113,26 @@ func TestSyncSetValidate(t *testing.T) {
 			expectedAllowed: false,
 		},
 		{
+			name:      "Test invalid SecretReference source not in SyncSet namespace",
+			operation: admissionv1beta1.Create,
+			syncSet: func() *hivev1.SyncSet {
+				ss := testSecretReferenceSyncSet()
+				ss.Spec.Secrets[0].SourceRef.Namespace = "anotherns"
+				return ss
+			}(),
+			expectedAllowed: false,
+		},
+		{
+			name:      "Test valid SecretReference source has empty namespace",
+			operation: admissionv1beta1.Create,
+			syncSet: func() *hivev1.SyncSet {
+				ss := testSecretReferenceSyncSet()
+				ss.Spec.Secrets[0].SourceRef.Namespace = ""
+				return ss
+			}(),
+			expectedAllowed: true,
+		},
+		{
 			name:      "Test invalid SecretReference no target name create",
 			operation: admissionv1beta1.Create,
 			syncSet: func() *hivev1.SyncSet {
@@ -137,9 +163,95 @@ func TestSyncSetValidate(t *testing.T) {
 			expectedAllowed: false,
 		},
 		{
-			name:            "Test invalid unmarshalable TypeMeta Resource create",
+			name:      "Test valid empty string resourceApplyMode create",
+			operation: admissionv1beta1.Create,
+			syncSet: func() *hivev1.SyncSet {
+				ss := testSyncSet()
+				ss.Spec.ResourceApplyMode = ""
+				return ss
+			}(),
+			expectedAllowed: true,
+		},
+		{
+			name:      "Test valid empty string resourceApplyMode update",
+			operation: admissionv1beta1.Update,
+			syncSet: func() *hivev1.SyncSet {
+				ss := testSyncSet()
+				ss.Spec.ResourceApplyMode = ""
+				return ss
+			}(),
+			expectedAllowed: true,
+		},
+		{
+			name:      "Test valid Upsert resourceApplyMode create",
+			operation: admissionv1beta1.Create,
+			syncSet: func() *hivev1.SyncSet {
+				ss := testSyncSet()
+				ss.Spec.ResourceApplyMode = "Upsert"
+				return ss
+			}(),
+			expectedAllowed: true,
+		},
+		{
+			name:      "Test valid Upsert resourceApplyMode update",
+			operation: admissionv1beta1.Update,
+			syncSet: func() *hivev1.SyncSet {
+				ss := testSyncSet()
+				ss.Spec.ResourceApplyMode = "Upsert"
+				return ss
+			}(),
+			expectedAllowed: true,
+		},
+		{
+			name:      "Test valid Sync resourceApplyMode create",
+			operation: admissionv1beta1.Create,
+			syncSet: func() *hivev1.SyncSet {
+				ss := testSyncSet()
+				ss.Spec.ResourceApplyMode = "Sync"
+				return ss
+			}(),
+			expectedAllowed: true,
+		},
+		{
+			name:      "Test valid Sync resourceApplyMode update",
+			operation: admissionv1beta1.Update,
+			syncSet: func() *hivev1.SyncSet {
+				ss := testSyncSet()
+				ss.Spec.ResourceApplyMode = "Sync"
+				return ss
+			}(),
+			expectedAllowed: true,
+		},
+		{
+			name:      "Test invalid resourceApplyMode create",
+			operation: admissionv1beta1.Create,
+			syncSet: func() *hivev1.SyncSet {
+				ss := testSyncSet()
+				ss.Spec.ResourceApplyMode = "sync"
+				return ss
+			}(),
+			expectedAllowed: false,
+		},
+		{
+			name:      "Test invalid resourceApplyMode update",
+			operation: admissionv1beta1.Update,
+			syncSet: func() *hivev1.SyncSet {
+				ss := testSyncSet()
+				ss.Spec.ResourceApplyMode = "sync"
+				return ss
+			}(),
+			expectedAllowed: false,
+		},
+		{
+			name:            "Test invalid unmarshalable Resource create",
 			operation:       admissionv1beta1.Create,
 			syncSet:         testSyncSetWithResources(`{"apiVersion": 798786}`),
+			expectedAllowed: false,
+		},
+		{
+			name:            "Test missing Kind Resource create",
+			operation:       admissionv1beta1.Create,
+			syncSet:         testSyncSetWithResources(`{"apiVersion": "v1"}`),
 			expectedAllowed: false,
 		},
 		{
@@ -268,7 +380,7 @@ func TestSyncSetValidate(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Arrange
-			data := SyncSetValidatingAdmissionHook{}
+			data := NewSyncSetValidatingAdmissionHook(createDecoder(t))
 
 			objectRaw, _ := json.Marshal(tc.syncSet)
 
@@ -330,7 +442,7 @@ func testSecretReferenceSyncSet() *hivev1.SyncSet {
 				{
 					SourceRef: hivev1.SecretReference{
 						Name:      "foo",
-						Namespace: "foo",
+						Namespace: syncSetNS,
 					},
 					TargetRef: hivev1.SecretReference{
 						Name:      "foo",
@@ -347,7 +459,7 @@ func testSyncSet() *hivev1.SyncSet {
 	return &hivev1.SyncSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-sync-set",
-			Namespace: "test-namespace",
+			Namespace: syncSetNS,
 		},
 	}
 }

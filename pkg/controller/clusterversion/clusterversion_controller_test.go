@@ -2,12 +2,12 @@ package clusterversion
 
 import (
 	"context"
-	"reflect"
 	"testing"
 	"time"
 
 	"github.com/golang/mock/gomock"
 	log "github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,9 +20,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	configv1 "github.com/openshift/api/config/v1"
+
 	"github.com/openshift/hive/pkg/apis"
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
 	hivev1aws "github.com/openshift/hive/pkg/apis/hive/v1/aws"
+	"github.com/openshift/hive/pkg/constants"
 	"github.com/openshift/hive/pkg/remoteclient"
 	remoteclientmock "github.com/openshift/hive/pkg/remoteclient/mock"
 )
@@ -65,16 +67,15 @@ func TestClusterVersionReconcile(t *testing.T) {
 			noRemoteCall: true,
 		},
 		{
-			name: "needs update",
+			name: "version in labels",
 			existing: []runtime.Object{
 				testClusterDeployment(),
 				testKubeconfigSecret(),
 			},
 			validate: func(t *testing.T, cd *hivev1.ClusterDeployment) {
-				expected := testRemoteClusterVersionStatus()
-				if !reflect.DeepEqual(cd.Status.ClusterVersionStatus, expected) {
-					t.Errorf("did not get expected clusterversion status. Expected: \n%#v\nGot: \n%#v", expected, cd.Status.ClusterVersionStatus)
-				}
+				assert.Equal(t, "2", cd.Labels[constants.VersionMajorLabel], "unexpected version major label")
+				assert.Equal(t, "2.3", cd.Labels[constants.VersionMajorMinorLabel], "unexpected version major-minor label")
+				assert.Equal(t, "2.3.4", cd.Labels[constants.VersionMajorMinorPatchLabel], "unexpected version major-minor-patch label")
 			},
 		},
 	}
@@ -86,7 +87,6 @@ func TestClusterVersionReconcile(t *testing.T) {
 			defer mockCtrl.Finish()
 			mockRemoteClientBuilder := remoteclientmock.NewMockBuilder(mockCtrl)
 			if !test.noRemoteCall {
-				mockRemoteClientBuilder.EXPECT().Unreachable().Return(false)
 				mockRemoteClientBuilder.EXPECT().Build().Return(testRemoteClusterAPIClient(), nil)
 			}
 			rcd := &ReconcileClusterVersion{
@@ -151,6 +151,12 @@ func testClusterDeployment() *hivev1.ClusterDeployment {
 			},
 			Installed: true,
 		},
+		Status: hivev1.ClusterDeploymentStatus{
+			Conditions: []hivev1.ClusterDeploymentCondition{{
+				Type:   hivev1.UnreachableCondition,
+				Status: corev1.ConditionFalse,
+			}},
+		},
 	}
 	return cd
 }
@@ -185,14 +191,17 @@ func testRemoteClusterAPIClient() client.Client {
 			Name: remoteClusterVersionObjectName,
 		},
 	}
-	remoteClusterVersion.Status = testRemoteClusterVersionStatus()
+	remoteClusterVersion.Status = *testRemoteClusterVersionStatus()
 
 	return fake.NewFakeClient(remoteClusterVersion)
 }
 
-func testRemoteClusterVersionStatus() configv1.ClusterVersionStatus {
+func testRemoteClusterVersionStatus() *configv1.ClusterVersionStatus {
 	zeroTime := metav1.NewTime(time.Unix(0, 0))
-	status := configv1.ClusterVersionStatus{
+	return &configv1.ClusterVersionStatus{
+		Desired: configv1.Update{
+			Version: "2.3.4+somebuild",
+		},
 		History: []configv1.UpdateHistory{
 			{
 				State:          configv1.CompletedUpdate,
@@ -204,5 +213,4 @@ func testRemoteClusterVersionStatus() configv1.ClusterVersionStatus {
 		ObservedGeneration: 123456789,
 		VersionHash:        "TESTVERSIONHASH",
 	}
-	return status
 }

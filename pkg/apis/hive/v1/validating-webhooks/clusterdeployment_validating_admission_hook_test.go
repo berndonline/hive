@@ -18,6 +18,9 @@ import (
 	hivev1aws "github.com/openshift/hive/pkg/apis/hive/v1/aws"
 	hivev1azure "github.com/openshift/hive/pkg/apis/hive/v1/azure"
 	hivev1gcp "github.com/openshift/hive/pkg/apis/hive/v1/gcp"
+	hivev1openstack "github.com/openshift/hive/pkg/apis/hive/v1/openstack"
+	hivev1ovirt "github.com/openshift/hive/pkg/apis/hive/v1/ovirt"
+	hivev1vsphere "github.com/openshift/hive/pkg/apis/hive/v1/vsphere"
 	"github.com/openshift/hive/pkg/constants"
 )
 
@@ -77,12 +80,61 @@ func validAWSClusterDeployment() *hivev1.ClusterDeployment {
 	return cd
 }
 
+func validAWSClusterDeploymentFromPool(poolNS, poolName, claimName string) *hivev1.ClusterDeployment {
+	cd := clusterDeploymentTemplate()
+	cd.Spec.Platform.AWS = &hivev1aws.Platform{
+		CredentialsSecretRef: corev1.LocalObjectReference{Name: "fake-creds-secret"},
+		Region:               "test-region",
+	}
+	cd.Spec.ClusterPoolRef = &hivev1.ClusterPoolReference{
+		Namespace: poolNS,
+		PoolName:  poolName,
+		ClaimName: claimName,
+	}
+	return cd
+}
+
 func validAzureClusterDeployment() *hivev1.ClusterDeployment {
 	cd := clusterDeploymentTemplate()
 	cd.Spec.Platform.Azure = &hivev1azure.Platform{
 		CredentialsSecretRef:        corev1.LocalObjectReference{Name: "fake-creds-secret"},
 		Region:                      "test-region",
 		BaseDomainResourceGroupName: "os4-common",
+	}
+	return cd
+}
+
+func validOpenStackClusterDeployment() *hivev1.ClusterDeployment {
+	cd := clusterDeploymentTemplate()
+	cd.Spec.Platform.OpenStack = &hivev1openstack.Platform{
+		CredentialsSecretRef: corev1.LocalObjectReference{Name: "fake-creds-secret"},
+		Cloud:                "somecloud",
+	}
+	return cd
+}
+
+func validVSphereClusterDeployment() *hivev1.ClusterDeployment {
+	cd := clusterDeploymentTemplate()
+	cd.Spec.Platform.VSphere = &hivev1vsphere.Platform{
+		VCenter:               "somevcenter.com",
+		CredentialsSecretRef:  corev1.LocalObjectReference{Name: "fake-creds-secret"},
+		CertificatesSecretRef: corev1.LocalObjectReference{Name: "fake-cert-secret"},
+		Datacenter:            "dc1",
+		DefaultDatastore:      "vmse-test",
+		Folder:                "/dc1/vm/test",
+		Cluster:               "test",
+		Network:               "Network",
+	}
+	return cd
+}
+
+func validOvirtClusterDeployment() *hivev1.ClusterDeployment {
+	cd := clusterDeploymentTemplate()
+	cd.Spec.Platform.Ovirt = &hivev1ovirt.Platform{
+		ClusterID:             "fake-cluster-uuid",
+		CredentialsSecretRef:  corev1.LocalObjectReference{Name: "fake-creds-secret"},
+		CertificatesSecretRef: corev1.LocalObjectReference{Name: "fake-cert-secret"},
+		StorageDomainID:       "fake-storage-domain-uuid",
 	}
 	return cd
 }
@@ -106,7 +158,7 @@ func validClusterDeploymentDifferentMutableValue() *hivev1.ClusterDeployment {
 
 func TestClusterDeploymentValidatingResource(t *testing.T) {
 	// Arrange
-	data := ClusterDeploymentValidatingAdmissionHook{}
+	data := NewClusterDeploymentValidatingAdmissionHook(createDecoder(t))
 	expectedPlural := schema.GroupVersionResource{
 		Group:    "admission.hive.openshift.io",
 		Version:  "v1",
@@ -124,7 +176,7 @@ func TestClusterDeploymentValidatingResource(t *testing.T) {
 
 func TestClusterDeploymentInitialize(t *testing.T) {
 	// Arrange
-	data := ClusterDeploymentValidatingAdmissionHook{}
+	data := NewClusterDeploymentValidatingAdmissionHook(createDecoder(t))
 
 	// Act
 	err := data.Initialize(nil, nil)
@@ -191,6 +243,60 @@ func TestClusterDeploymentValidate(t *testing.T) {
 				return cd
 			}(),
 			newObject:       validAWSClusterDeployment(),
+			operation:       admissionv1beta1.Update,
+			expectedAllowed: false,
+		},
+		{
+			name:            "Test create with ClusterPoolReference",
+			newObject:       validAWSClusterDeploymentFromPool("pool-ns", "mypool", ""),
+			operation:       admissionv1beta1.Create,
+			expectedAllowed: true,
+		},
+		{
+			name:            "Test create with Claimed ClusterPoolReference",
+			newObject:       validAWSClusterDeploymentFromPool("pool-ns", "mypool", "test-claim"),
+			operation:       admissionv1beta1.Create,
+			expectedAllowed: false,
+		},
+		{
+			name:            "Test update with removed ClusterPoolReference",
+			oldObject:       validAWSClusterDeploymentFromPool("pool-ns", "mypool", ""),
+			newObject:       validAWSClusterDeployment(),
+			operation:       admissionv1beta1.Update,
+			expectedAllowed: false,
+		},
+		{
+			name:            "Test update with added ClusterPoolReference",
+			oldObject:       validAWSClusterDeployment(),
+			newObject:       validAWSClusterDeploymentFromPool("pool-ns", "mypool", ""),
+			operation:       admissionv1beta1.Update,
+			expectedAllowed: false,
+		},
+		{
+			name:            "Test update with modified ClusterPoolReference",
+			oldObject:       validAWSClusterDeploymentFromPool("pool-ns", "mypool", ""),
+			newObject:       validAWSClusterDeploymentFromPool("new-pool-ns", "new-mypool", ""),
+			operation:       admissionv1beta1.Update,
+			expectedAllowed: false,
+		},
+		{
+			name:            "Test update with claimed ClusterPoolReference",
+			oldObject:       validAWSClusterDeploymentFromPool("pool-ns", "mypool", ""),
+			newObject:       validAWSClusterDeploymentFromPool("pool-ns", "mypool", "test-claim"),
+			operation:       admissionv1beta1.Update,
+			expectedAllowed: true,
+		},
+		{
+			name:            "Test update with unclaimed ClusterPoolReference",
+			oldObject:       validAWSClusterDeploymentFromPool("pool-ns", "mypool", "test-claim"),
+			newObject:       validAWSClusterDeploymentFromPool("pool-ns", "mypool", ""),
+			operation:       admissionv1beta1.Update,
+			expectedAllowed: false,
+		},
+		{
+			name:            "Test update with changed claim",
+			oldObject:       validAWSClusterDeploymentFromPool("pool-ns", "mypool", "test-claim"),
+			newObject:       validAWSClusterDeploymentFromPool("pool-ns", "mypool", "other-claim"),
 			operation:       admissionv1beta1.Update,
 			expectedAllowed: false,
 		},
@@ -350,8 +456,20 @@ func TestClusterDeploymentValidate(t *testing.T) {
 			expectedAllowed: true,
 		},
 		{
-			name:            "Test invalid managed domain",
+			name:            "Test base domain is not child of a managed domain",
+			newObject:       clusterDeploymentWithManagedDomain("bar.bad-domain.com"),
+			operation:       admissionv1beta1.Create,
+			expectedAllowed: false,
+		},
+		{
+			name:            "Test base domain is not direct child of a managed domain",
 			newObject:       clusterDeploymentWithManagedDomain("baz.foo.bbb.com"),
+			operation:       admissionv1beta1.Create,
+			expectedAllowed: false,
+		},
+		{
+			name:            "Test base domain is not same as one of the managed domains",
+			newObject:       clusterDeploymentWithManagedDomain("foo.aaa.com"),
 			operation:       admissionv1beta1.Create,
 			expectedAllowed: false,
 		},
@@ -367,7 +485,7 @@ func TestClusterDeploymentValidate(t *testing.T) {
 			expectedAllowed: true,
 		},
 		{
-			name: "Test managed DNS is invalid on Azure",
+			name: "Test managed DNS is valid on Azure",
 			newObject: func() *hivev1.ClusterDeployment {
 				cd := validAzureClusterDeployment()
 				cd.Spec.ManageDNS = true
@@ -375,7 +493,7 @@ func TestClusterDeploymentValidate(t *testing.T) {
 				return cd
 			}(),
 			operation:       admissionv1beta1.Create,
-			expectedAllowed: false,
+			expectedAllowed: true,
 		},
 		{
 			name:      "Test allow modifying controlPlaneConfig",
@@ -642,12 +760,69 @@ func TestClusterDeploymentValidate(t *testing.T) {
 			operation:       admissionv1beta1.Create,
 			expectedAllowed: false,
 		},
+		{
+			name:            "OpenStack create valid",
+			newObject:       validOpenStackClusterDeployment(),
+			operation:       admissionv1beta1.Create,
+			expectedAllowed: true,
+		},
+		{
+			name:            "Test valid delete",
+			oldObject:       validAWSClusterDeployment(),
+			operation:       admissionv1beta1.Delete,
+			expectedAllowed: true,
+		},
+		{
+			name: "Test protected delete",
+			oldObject: func() *hivev1.ClusterDeployment {
+				cd := validAWSClusterDeployment()
+				if cd.Annotations == nil {
+					cd.Annotations = make(map[string]string, 1)
+				}
+				cd.Annotations[constants.ProtectedDeleteAnnotation] = "true"
+				return cd
+			}(),
+			operation:       admissionv1beta1.Delete,
+			expectedAllowed: false,
+		},
+		{
+			name: "Test protected delete annotation false",
+			oldObject: func() *hivev1.ClusterDeployment {
+				cd := validAWSClusterDeployment()
+				if cd.Annotations == nil {
+					cd.Annotations = make(map[string]string, 1)
+				}
+				cd.Annotations[constants.ProtectedDeleteAnnotation] = "false"
+				return cd
+			}(),
+			operation:       admissionv1beta1.Delete,
+			expectedAllowed: true,
+		},
+		{
+			name:            "Test delete on OpenShift 3.11",
+			oldObject:       nil,
+			operation:       admissionv1beta1.Delete,
+			expectedAllowed: true,
+		},
+		{
+			name:            "vSphere create valid",
+			newObject:       validVSphereClusterDeployment(),
+			operation:       admissionv1beta1.Create,
+			expectedAllowed: true,
+		},
+		{
+			name:            "oVirt create valid",
+			newObject:       validOvirtClusterDeployment(),
+			operation:       admissionv1beta1.Create,
+			expectedAllowed: true,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Arrange
 			data := ClusterDeploymentValidatingAdmissionHook{
+				decoder:             createDecoder(t),
 				validManagedDomains: validTestManagedDomains,
 			}
 
@@ -732,6 +907,6 @@ func TestNewClusterDeploymentValidatingAdmissionHook(t *testing.T) {
 		t.Fatalf("unexpected: %v", err)
 	}
 	os.Setenv(constants.ManagedDomainsFileEnvVar, tempFile.Name())
-	webhook := NewClusterDeploymentValidatingAdmissionHook()
+	webhook := NewClusterDeploymentValidatingAdmissionHook(createDecoder(t))
 	assert.Equal(t, webhook.validManagedDomains, expectedDomains, "valid domains must match expected")
 }

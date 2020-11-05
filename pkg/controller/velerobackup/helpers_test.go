@@ -121,7 +121,8 @@ func fakeClientReconcileBackup(existingObjects []runtime.Object) *ReconcileBacku
 		Client:                     fake.NewFakeClient(existingObjects...),
 		scheme:                     scheme.Scheme,
 		reconcileRateLimitDuration: defaultReconcileRateLimitDuration,
-		logger:                     log.WithField("controller", controllerName),
+		logger:                     log.WithField("controller", ControllerName),
+		veleroNamespace:            "velero",
 	}
 }
 

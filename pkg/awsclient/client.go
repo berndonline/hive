@@ -28,13 +28,10 @@ import (
 	"github.com/aws/aws-sdk-go/service/route53/route53iface"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
+	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/aws/aws-sdk-go/service/sts/stsiface"
 
 	"github.com/openshift/hive/pkg/constants"
-)
-
-const (
-	awsCredsSecretIDKey     = "aws_access_key_id"
-	awsCredsSecretAccessKey = "aws_secret_access_key"
 )
 
 var (
@@ -64,6 +61,8 @@ type Client interface {
 	RunInstances(*ec2.RunInstancesInput) (*ec2.Reservation, error)
 	DescribeInstances(*ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error)
 	TerminateInstances(*ec2.TerminateInstancesInput) (*ec2.TerminateInstancesOutput, error)
+	StopInstances(*ec2.StopInstancesInput) (*ec2.StopInstancesOutput, error)
+	StartInstances(*ec2.StartInstancesInput) (*ec2.StartInstancesOutput, error)
 
 	// ELB
 	RegisterInstancesWithLoadBalancer(*elb.RegisterInstancesWithLoadBalancerInput) (*elb.RegisterInstancesWithLoadBalancerOutput, error)
@@ -100,6 +99,9 @@ type Client interface {
 
 	// ResourceTagging
 	GetResourcesPages(input *resourcegroupstaggingapi.GetResourcesInput, fn func(*resourcegroupstaggingapi.GetResourcesOutput, bool) bool) error
+
+	// STS
+	GetCallerIdentity(input *sts.GetCallerIdentityInput) (*sts.GetCallerIdentityOutput, error)
 }
 
 type awsClient struct {
@@ -108,6 +110,7 @@ type awsClient struct {
 	iamClient     iamiface.IAMAPI
 	route53Client route53iface.Route53API
 	s3Client      s3iface.S3API
+	stsClient     stsiface.STSAPI
 	tagClient     *resourcegroupstaggingapi.ResourceGroupsTaggingAPI
 }
 
@@ -151,6 +154,16 @@ func (c *awsClient) TerminateInstances(input *ec2.TerminateInstancesInput) (*ec2
 	return c.ec2Client.TerminateInstances(input)
 }
 
+func (c *awsClient) StopInstances(input *ec2.StopInstancesInput) (*ec2.StopInstancesOutput, error) {
+	metricAWSAPICalls.WithLabelValues("StopInstances").Inc()
+	return c.ec2Client.StopInstances(input)
+}
+
+func (c *awsClient) StartInstances(input *ec2.StartInstancesInput) (*ec2.StartInstancesOutput, error) {
+	metricAWSAPICalls.WithLabelValues("StartInstances").Inc()
+	return c.ec2Client.StartInstances(input)
+}
+
 func (c *awsClient) RegisterInstancesWithLoadBalancer(input *elb.RegisterInstancesWithLoadBalancerInput) (*elb.RegisterInstancesWithLoadBalancerOutput, error) {
 	metricAWSAPICalls.WithLabelValues("RegisterInstancesWithLoadBalancer").Inc()
 	return c.elbClient.RegisterInstancesWithLoadBalancer(input)
@@ -172,7 +185,7 @@ func (c *awsClient) DeleteAccessKey(input *iam.DeleteAccessKeyInput) (*iam.Delet
 }
 
 func (c *awsClient) DeleteUser(input *iam.DeleteUserInput) (*iam.DeleteUserOutput, error) {
-	metricAWSAPICalls.WithLabelValues("DescribeUser").Inc()
+	metricAWSAPICalls.WithLabelValues("DeleteUser").Inc()
 	return c.iamClient.DeleteUser(input)
 }
 
@@ -264,8 +277,13 @@ func (c *awsClient) ListResourceRecordSets(input *route53.ListResourceRecordSets
 }
 
 func (c *awsClient) ChangeResourceRecordSets(input *route53.ChangeResourceRecordSetsInput) (*route53.ChangeResourceRecordSetsOutput, error) {
-	metricAWSAPICalls.WithLabelValues("ListResourceRecordSets").Inc()
+	metricAWSAPICalls.WithLabelValues("ChangeResourceRecordSets").Inc()
 	return c.route53Client.ChangeResourceRecordSets(input)
+}
+
+func (c *awsClient) GetCallerIdentity(input *sts.GetCallerIdentityInput) (*sts.GetCallerIdentityOutput, error) {
+	metricAWSAPICalls.WithLabelValues("GetCallerIdentity").Inc()
+	return c.stsClient.GetCallerIdentity(input)
 }
 
 // NewClient creates our client wrapper object for the actual AWS clients we use.
@@ -310,15 +328,16 @@ func NewClientFromSecret(secret *corev1.Secret, region string) (Client, error) {
 
 	// Special case to not use a secret to gather credentials.
 	if secret != nil {
-		accessKeyID, ok := secret.Data[awsCredsSecretIDKey]
+		accessKeyID, ok := secret.Data[constants.AWSAccessKeyIDSecretKey]
 		if !ok {
 			return nil, fmt.Errorf("AWS credentials secret %v did not contain key %v",
-				secret.Name, awsCredsSecretIDKey)
+				secret.Name, constants.AWSAccessKeyIDSecretKey)
 		}
-		secretAccessKey, ok := secret.Data[awsCredsSecretAccessKey]
+		secretAccessKey, ok := secret.Data[constants.AWSSecretAccessKeySecretKey]
 		if !ok {
 			return nil, fmt.Errorf("AWS credentials secret %v did not contain key %v",
-				secret.Name, awsCredsSecretAccessKey)
+				secret.Name, constants.AWSSecretAccessKeySecretKey)
+
 		}
 
 		awsConfig.Credentials = credentials.NewStaticCredentials(
@@ -342,6 +361,7 @@ func NewClientFromSecret(secret *corev1.Secret, region string) (Client, error) {
 		iamClient:     iam.New(s),
 		s3Client:      s3.New(s),
 		route53Client: route53.New(s),
+		stsClient:     sts.New(s),
 		tagClient:     resourcegroupstaggingapi.New(s),
 	}, nil
 }

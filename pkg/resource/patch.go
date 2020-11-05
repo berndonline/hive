@@ -7,8 +7,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
-	kcmdpatch "k8s.io/kubernetes/pkg/kubectl/cmd/patch"
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
+	kcmdpatch "k8s.io/kubectl/pkg/cmd/patch"
+	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 )
 
 var (
@@ -20,7 +20,7 @@ var (
 )
 
 // Patch invokes the kubectl patch command with the given resource, patch and patch type
-func (r *Helper) Patch(name types.NamespacedName, kind, apiVersion string, patch []byte, patchType string) error {
+func (r *helper) Patch(name types.NamespacedName, kind, apiVersion string, patch []byte, patchType string) error {
 
 	ioStreams := genericclioptions.IOStreams{
 		In:     &bytes.Buffer{},
@@ -40,13 +40,16 @@ func (r *Helper) Patch(name types.NamespacedName, kind, apiVersion string, patch
 	if err != nil {
 		r.logger.WithError(err).
 			WithField("stdout", ioStreams.Out.(*bytes.Buffer).String()).
-			WithField("stderr", ioStreams.ErrOut.(*bytes.Buffer).String()).Error("running the patch command failed")
+			WithField("stderr", ioStreams.ErrOut.(*bytes.Buffer).String()).Warn("running the patch command failed")
 		return err
 	}
+	r.logger.
+		WithField("stdout", ioStreams.Out.(*bytes.Buffer).String()).
+		WithField("stderr", ioStreams.ErrOut.(*bytes.Buffer).String()).Info("patch command successful")
 	return nil
 }
 
-func (r *Helper) setupPatchCommand(name, kind, apiVersion, patchType string, f cmdutil.Factory, patch string, ioStreams genericclioptions.IOStreams) (*kcmdpatch.PatchOptions, error) {
+func (r *helper) setupPatchCommand(name, kind, apiVersion, patchType string, f cmdutil.Factory, patch string, ioStreams genericclioptions.IOStreams) (*kcmdpatch.PatchOptions, error) {
 
 	cmd := kcmdpatch.NewCmdPatch(f, ioStreams)
 	cmd.Flags().Parse([]string{})

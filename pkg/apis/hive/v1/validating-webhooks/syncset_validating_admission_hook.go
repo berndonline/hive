@@ -2,12 +2,10 @@ package validatingwebhooks
 
 import (
 	"encoding/json"
-
-	log "github.com/sirupsen/logrus"
-
 	"net/http"
 
-	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
+	log "github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	admissionv1beta1 "k8s.io/api/admission/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -16,6 +14,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
 )
 
 const (
@@ -42,8 +43,30 @@ var validPatchTypes = map[string]bool{
 
 var validPatchTypeSlice = []string{"json", "merge", "strategic"}
 
+var (
+	validResourceApplyModes = map[hivev1.SyncSetResourceApplyMode]bool{
+		hivev1.UpsertResourceApplyMode: true,
+		hivev1.SyncResourceApplyMode:   true,
+	}
+
+	validResourceApplyModeSlice = func() []string {
+		v := make([]string, 0, len(validResourceApplyModes))
+		for m := range validResourceApplyModes {
+			v = append(v, string(m))
+		}
+		return v
+	}()
+)
+
 // SyncSetValidatingAdmissionHook is a struct that is used to reference what code should be run by the generic-admission-server.
-type SyncSetValidatingAdmissionHook struct{}
+type SyncSetValidatingAdmissionHook struct {
+	decoder *admission.Decoder
+}
+
+// NewSyncSetValidatingAdmissionHook constructs a new SyncSetValidatingAdmissionHook
+func NewSyncSetValidatingAdmissionHook(decoder *admission.Decoder) *SyncSetValidatingAdmissionHook {
+	return &SyncSetValidatingAdmissionHook{decoder: decoder}
+}
 
 // ValidatingResource is called by generic-admission-server on startup to register the returned REST resource through which the
 //                    webhook is accessed by the kube apiserver.
@@ -153,8 +176,7 @@ func (a *SyncSetValidatingAdmissionHook) validateCreate(admissionSpec *admission
 	})
 
 	newObject := &hivev1.SyncSet{}
-	err := json.Unmarshal(admissionSpec.Object.Raw, newObject)
-	if err != nil {
+	if err := a.decoder.DecodeRaw(admissionSpec.Object, newObject); err != nil {
 		contextLogger.Errorf("Failed unmarshaling Object: %v", err.Error())
 		return &admissionv1beta1.AdmissionResponse{
 			Allowed: false,
@@ -172,6 +194,8 @@ func (a *SyncSetValidatingAdmissionHook) validateCreate(admissionSpec *admission
 	allErrs = append(allErrs, validateResources(newObject.Spec.Resources, field.NewPath("spec").Child("resources"))...)
 	allErrs = append(allErrs, validatePatches(newObject.Spec.Patches, field.NewPath("spec").Child("patches"))...)
 	allErrs = append(allErrs, validateSecrets(newObject.Spec.Secrets, field.NewPath("spec").Child("secretMappings"))...)
+	allErrs = append(allErrs, validateSourceSecretInSyncSetNamespace(newObject.Spec.Secrets, newObject.Namespace, field.NewPath("spec", "secretMappings"))...)
+	allErrs = append(allErrs, validateResourceApplyMode(newObject.Spec.ResourceApplyMode, field.NewPath("spec", "resourceApplyMode"))...)
 
 	if len(allErrs) > 0 {
 		statusError := errors.NewInvalid(newObject.GroupVersionKind().GroupKind(), newObject.Name, allErrs).Status()
@@ -200,8 +224,7 @@ func (a *SyncSetValidatingAdmissionHook) validateUpdate(admissionSpec *admission
 	})
 
 	newObject := &hivev1.SyncSet{}
-	err := json.Unmarshal(admissionSpec.Object.Raw, newObject)
-	if err != nil {
+	if err := a.decoder.DecodeRaw(admissionSpec.Object, newObject); err != nil {
 		contextLogger.Errorf("Failed unmarshaling Object: %v", err.Error())
 		return &admissionv1beta1.AdmissionResponse{
 			Allowed: false,
@@ -219,6 +242,8 @@ func (a *SyncSetValidatingAdmissionHook) validateUpdate(admissionSpec *admission
 	allErrs = append(allErrs, validateResources(newObject.Spec.Resources, field.NewPath("spec", "resources"))...)
 	allErrs = append(allErrs, validatePatches(newObject.Spec.Patches, field.NewPath("spec", "patches"))...)
 	allErrs = append(allErrs, validateSecrets(newObject.Spec.Secrets, field.NewPath("spec", "secretMappings"))...)
+	allErrs = append(allErrs, validateSourceSecretInSyncSetNamespace(newObject.Spec.Secrets, newObject.Namespace, field.NewPath("spec", "secretMappings"))...)
+	allErrs = append(allErrs, validateResourceApplyMode(newObject.Spec.ResourceApplyMode, field.NewPath("spec", "resourceApplyMode"))...)
 
 	if len(allErrs) > 0 {
 		statusError := errors.NewInvalid(newObject.GroupVersionKind().GroupKind(), newObject.Name, allErrs).Status()
@@ -247,6 +272,14 @@ func validatePatches(patches []hivev1.SyncObjectPatch, fldPath *field.Path) fiel
 	return allErrs
 }
 
+func validateResourceApplyMode(resourceApplyMode hivev1.SyncSetResourceApplyMode, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+	if resourceApplyMode != "" && !validResourceApplyModes[resourceApplyMode] {
+		allErrs = append(allErrs, field.NotSupported(fldPath, resourceApplyMode, validResourceApplyModeSlice))
+	}
+	return allErrs
+}
+
 func validateResources(resources []runtime.RawExtension, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 	for i, resource := range resources {
@@ -258,15 +291,15 @@ func validateResources(resources []runtime.RawExtension, fldPath *field.Path) fi
 func validateResource(resource runtime.RawExtension, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 
-	rType := &metav1.TypeMeta{}
-	err := json.Unmarshal(resource.Raw, rType)
+	u := &unstructured.Unstructured{}
+	err := json.Unmarshal(resource.Raw, u)
 	if err != nil {
-		allErrs = append(allErrs, field.Invalid(fldPath, resource.Raw, "Unable to unmarshal resource Kind and APIVersion"))
+		allErrs = append(allErrs, field.Invalid(fldPath, resource.Raw, "Unable to unmarshal resource"))
 		return allErrs
 	}
 
-	if invalidResourceGroupKinds[rType.GroupVersionKind().Group][rType.Kind] {
-		allErrs = append(allErrs, field.Invalid(fldPath.Child("APIVersion"), rType.APIVersion, "must use kubernetes group for this resource kind"))
+	if invalidResourceGroupKinds[u.GroupVersionKind().Group][u.GetKind()] {
+		allErrs = append(allErrs, field.Invalid(fldPath.Child("APIVersion"), u.GetAPIVersion(), "must use kubernetes group for this resource kind"))
 	}
 
 	return allErrs
@@ -277,6 +310,19 @@ func validateSecrets(secrets []hivev1.SecretMapping, fldPath *field.Path) field.
 	for i, secret := range secrets {
 		allErrs = append(allErrs, validateSecretRef(secret.SourceRef, fldPath.Index(i).Child("sourceRef"))...)
 		allErrs = append(allErrs, validateSecretRef(secret.TargetRef, fldPath.Index(i).Child("targetRef"))...)
+	}
+	return allErrs
+}
+
+func validateSourceSecretInSyncSetNamespace(secrets []hivev1.SecretMapping, syncSetNS string, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+	for i, secret := range secrets {
+		if secret.SourceRef.Namespace != syncSetNS && secret.SourceRef.Namespace != "" {
+			path := fldPath.Index(i).Child("sourceRef")
+
+			allErrs = append(allErrs, field.Invalid(path.Child("namespace"), secret.SourceRef.Namespace,
+				"source secret reference must be in same namespace as SyncSet"))
+		}
 	}
 	return allErrs
 }

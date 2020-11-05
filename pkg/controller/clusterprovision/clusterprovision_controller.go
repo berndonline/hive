@@ -2,19 +2,20 @@ package clusterprovision
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
-
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	k8slabels "k8s.io/kubernetes/pkg/util/labels"
+	"k8s.io/client-go/util/flowcontrol"
+	"k8s.io/client-go/util/workqueue"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -30,20 +31,32 @@ import (
 	hivemetrics "github.com/openshift/hive/pkg/controller/metrics"
 	controllerutils "github.com/openshift/hive/pkg/controller/utils"
 	"github.com/openshift/hive/pkg/install"
+	k8slabels "github.com/openshift/hive/pkg/util/labels"
 )
 
 const (
-	controllerName = "clusterProvision"
+	ControllerName = hivev1.ClusterProvisionControllerName
 
 	// clusterProvisionLabelKey is the label that is used to identify
 	// resources descendant from a cluster provision.
 	clusterProvisionLabelKey = "hive.openshift.io/cluster-provision"
+
+	resultSuccess = "success"
+	resultFailure = "failure"
+
+	podStatusCheckDelay = 60 * time.Second
 )
 
 var (
 	// controllerKind contains the schema.GroupVersionKind for this controller type.
 	controllerKind = hivev1.SchemeGroupVersion.WithKind("ClusterProvision")
 
+	metricClusterProvisionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "hive_cluster_provision_results_total",
+		Help: "Counter incremented every time we observe a completed cluster provision.",
+	},
+		[]string{"cluster_type", "result"},
+	)
 	metricInstallErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "hive_install_errors",
 		Help: "Counter incremented every time we observe certain errors strings in install logs.",
@@ -54,19 +67,26 @@ var (
 
 func init() {
 	metrics.Registry.MustRegister(metricInstallErrors)
+	metrics.Registry.MustRegister(metricClusterProvisionsTotal)
 }
 
 // Add creates a new ClusterProvision Controller and adds it to the Manager with default RBAC. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func Add(mgr manager.Manager) error {
-	return add(mgr, newReconciler(mgr))
+	logger := log.WithField("controller", ControllerName)
+	concurrentReconciles, clientRateLimiter, queueRateLimiter, err := controllerutils.GetControllerConfig(mgr.GetClient(), ControllerName)
+	if err != nil {
+		logger.WithError(err).Error("could not get controller configurations")
+		return err
+	}
+	return add(mgr, newReconciler(mgr, clientRateLimiter), concurrentReconciles, queueRateLimiter)
 }
 
 // newReconciler returns a new reconcile.Reconciler
-func newReconciler(mgr manager.Manager) reconcile.Reconciler {
-	logger := log.WithField("controller", controllerName)
+func newReconciler(mgr manager.Manager, rateLimiter flowcontrol.RateLimiter) reconcile.Reconciler {
+	logger := log.WithField("controller", ControllerName)
 	return &ReconcileClusterProvision{
-		Client:       controllerutils.NewClientWithMetricsOrDie(mgr, controllerName),
+		Client:       controllerutils.NewClientWithMetricsOrDie(mgr, ControllerName, &rateLimiter),
 		scheme:       mgr.GetScheme(),
 		logger:       logger,
 		expectations: controllerutils.NewExpectations(logger),
@@ -74,14 +94,18 @@ func newReconciler(mgr manager.Manager) reconcile.Reconciler {
 }
 
 // add adds a new Controller to mgr with r as the reconcile.Reconciler
-func add(mgr manager.Manager, r reconcile.Reconciler) error {
+func add(mgr manager.Manager, r reconcile.Reconciler, concurrentReconciles int, rateLimiter workqueue.RateLimiter) error {
 	provisionReconciler, ok := r.(*ReconcileClusterProvision)
 	if !ok {
 		return errors.New("reconciler supplied is not a ReconcileClusterProvision")
 	}
 
 	// Create a new controller
-	c, err := controller.New("clusterprovision-controller", mgr, controller.Options{Reconciler: r})
+	c, err := controller.New("clusterprovision-controller", mgr, controller.Options{
+		Reconciler:              r,
+		MaxConcurrentReconciles: concurrentReconciles,
+		RateLimiter:             rateLimiter,
+	})
 	if err != nil {
 		return errors.Wrap(err, "could not create controller")
 	}
@@ -120,16 +144,10 @@ type ReconcileClusterProvision struct {
 // Reconcile reads that state of the cluster for a ClusterProvision object and makes changes based on the state read
 // and what is in the ClusterProvision.Spec
 func (r *ReconcileClusterProvision) Reconcile(request reconcile.Request) (reconcile.Result, error) {
-	start := time.Now()
-	pLog := r.logger.WithField("name", request.NamespacedName)
-
-	// For logging, we need to see when the reconciliation loop starts and ends.
+	pLog := controllerutils.BuildControllerLogger(ControllerName, "clusterProvision", request.NamespacedName)
 	pLog.Info("reconciling cluster provision")
-	defer func() {
-		dur := time.Since(start)
-		hivemetrics.MetricControllerReconcileTime.WithLabelValues(controllerName).Observe(dur.Seconds())
-		pLog.WithField("elapsed", dur).Info("reconcile complete")
-	}()
+	recobsrv := hivemetrics.NewReconcileObserver(ControllerName, pLog)
+	defer recobsrv.ObserveControllerReconcileTime()
 
 	// Fetch the ClusterProvision instance
 	instance := &hivev1.ClusterProvision{}
@@ -142,6 +160,13 @@ func (r *ReconcileClusterProvision) Reconcile(request reconcile.Request) (reconc
 		}
 		// Error reading the object - requeue the request.
 		pLog.WithError(err).Error("cannot get ClusterProvision")
+		return reconcile.Result{}, err
+	}
+
+	// Ensure owner references are correctly set
+	err = controllerutils.ReconcileOwnerReferences(instance, generateOwnershipUniqueKeys(instance), r, r.scheme, pLog)
+	if err != nil {
+		pLog.WithError(err).Error("Error reconciling object ownership")
 		return reconcile.Result{}, err
 	}
 
@@ -166,7 +191,15 @@ func (r *ReconcileClusterProvision) Reconcile(request reconcile.Request) (reconc
 			return r.reconcileRunningJob(instance, pLog)
 		}
 		return r.transitionStage(instance, hivev1.ClusterProvisionStageFailed, "NoJobReference", "Missing reference to install job", pLog)
-	case hivev1.ClusterProvisionStageComplete, hivev1.ClusterProvisionStageFailed:
+	case hivev1.ClusterProvisionStageComplete:
+		pLog.Debugf("ClusterProvision is %s", instance.Spec.Stage)
+		if instance.Status.JobRef != nil && time.Since(instance.CreationTimestamp.Time) > (24*time.Hour) {
+			return r.deleteInstallJob(instance, pLog)
+		}
+		// installJobDeletionRecheckDelay will be duration between current time and expected install job deletion time (provision creation time + 24 hours)
+		installJobDeletionRecheckDelay := instance.CreationTimestamp.Time.Add(24 * time.Hour).Sub(time.Now())
+		return reconcile.Result{RequeueAfter: installJobDeletionRecheckDelay}, nil
+	case hivev1.ClusterProvisionStageFailed:
 		pLog.Debugf("ClusterProvision is %s. Nothing more to do", instance.Spec.Stage)
 		return reconcile.Result{}, nil
 	default:
@@ -221,7 +254,7 @@ func (r *ReconcileClusterProvision) createJob(instance *hivev1.ClusterProvision,
 
 func (r *ReconcileClusterProvision) adoptJob(instance *hivev1.ClusterProvision, job *batchv1.Job, pLog log.FieldLogger) (reconcile.Result, error) {
 	instance.Status.JobRef = &corev1.LocalObjectReference{Name: job.Name}
-	return reconcile.Result{}, r.setCondition(instance, hivev1.ClusterProvisionJobCreated, "JobCreated", "Install job has been created", pLog)
+	return reconcile.Result{}, r.setCondition(instance, hivev1.ClusterProvisionJobCreated, corev1.ConditionTrue, "JobCreated", "Install job has been created", controllerutils.UpdateConditionAlways, pLog)
 }
 
 // check if the job has completed
@@ -233,7 +266,7 @@ func (r *ReconcileClusterProvision) reconcileRunningJob(instance *hivev1.Cluster
 	case apierrors.IsNotFound(err):
 		if cond := controllerutils.FindClusterProvisionCondition(instance.Status.Conditions, hivev1.ClusterProvisionFailedCondition); cond == nil {
 			pLog.Error("install job lost")
-			if err := r.setCondition(instance, hivev1.ClusterProvisionFailedCondition, "JobNotFound", "install job not found", pLog); err != nil {
+			if err := r.setCondition(instance, hivev1.ClusterProvisionFailedCondition, corev1.ConditionTrue, "JobNotFound", "install job not found", controllerutils.UpdateConditionAlways, pLog); err != nil {
 				return reconcile.Result{}, err
 			}
 		} else {
@@ -260,6 +293,33 @@ func (r *ReconcileClusterProvision) reconcileRunningJob(instance *hivev1.Cluster
 
 	pLog.Debug("install job still running")
 
+	if time.Since(job.CreationTimestamp.Time) > podStatusCheckDelay {
+		installPod, err := r.getInstallPod(job, pLog)
+		if err != nil {
+			pLog.WithError(err).Error("could not get install pod")
+			if err := r.setCondition(instance, hivev1.InstallPodStuckCondition, corev1.ConditionTrue, "InstallPodMissing", err.Error(), controllerutils.UpdateConditionIfReasonOrMessageChange, pLog); err != nil {
+				return reconcile.Result{}, err
+			}
+			return reconcile.Result{}, err
+		}
+
+		if installPod.Status.Phase == "Pending" {
+			pLog.WithField("pod", installPod.Name).Error("install pod is stuck")
+			if err := r.setCondition(instance, hivev1.InstallPodStuckCondition, corev1.ConditionTrue, "PodInPendingPhase", "pod is in pending phase", controllerutils.UpdateConditionIfReasonOrMessageChange, pLog); err != nil {
+				return reconcile.Result{}, err
+			}
+			// Since this controller is not watching pods, the ClusterProvision will not be re-synced if the pod does
+			// transition to the running phase later. However, if the pod does start running, then soon after either the
+			// install manager will set the InfraID on the ClusterProvision or the pod will fail.
+			return reconcile.Result{}, nil
+		}
+		if cond := controllerutils.FindClusterProvisionCondition(instance.Status.Conditions, hivev1.InstallPodStuckCondition); cond != nil && cond.Status == corev1.ConditionTrue {
+			if err := r.setCondition(instance, hivev1.InstallPodStuckCondition, corev1.ConditionFalse, "PodInRunningPhase", "pod is in running phase", controllerutils.UpdateConditionNever, pLog); err != nil {
+				return reconcile.Result{}, err
+			}
+		}
+	}
+
 	if instance.Spec.Stage == hivev1.ClusterProvisionStageInitializing && instance.Spec.InfraID != nil {
 		cd := hivev1.ClusterDeployment{}
 		if err := r.Get(
@@ -278,20 +338,60 @@ func (r *ReconcileClusterProvision) reconcileRunningJob(instance *hivev1.Cluster
 		}
 	}
 
+	if timeUntilNextPodStatusCheck := podStatusCheckDelay - time.Since(job.CreationTimestamp.Time); timeUntilNextPodStatusCheck > 0 {
+		return reconcile.Result{RequeueAfter: timeUntilNextPodStatusCheck}, nil
+	}
 	return reconcile.Result{}, nil
+}
+
+func (r *ReconcileClusterProvision) getInstallPod(job *batchv1.Job, pLog log.FieldLogger) (*corev1.Pod, error) {
+	podList := &corev1.PodList{}
+	podLabelSelector, err := metav1.LabelSelectorAsSelector(job.Spec.Selector)
+	if err != nil {
+		pLog.WithError(err).Error("could not create pod selector from job")
+		return nil, fmt.Errorf("could not create pod selector from job")
+	}
+	if err := r.List(
+		context.TODO(),
+		podList,
+		client.MatchingLabelsSelector{Selector: podLabelSelector},
+		client.InNamespace(job.Namespace),
+	); err != nil {
+		pLog.WithError(err).Error("could not list install pods")
+		return nil, fmt.Errorf("could not list install pods")
+	}
+
+	switch len(podList.Items) {
+	case 0:
+		pLog.Error("install pod not found")
+		return nil, fmt.Errorf("install pod not found")
+	case 1:
+		return &podList.Items[0], nil
+	default:
+		pLog.Error("more than one install pod exists")
+		return nil, fmt.Errorf("more than one install pod exists")
+	}
 }
 
 func (r *ReconcileClusterProvision) reconcileSuccessfulJob(instance *hivev1.ClusterProvision, job *batchv1.Job, pLog log.FieldLogger) (reconcile.Result, error) {
 	pLog.Info("install job succeeded")
-	return r.transitionStage(instance, hivev1.ClusterProvisionStageComplete, "InstallComplete", "Install job has completed successfully", pLog)
+	result, err := r.transitionStage(instance, hivev1.ClusterProvisionStageComplete, "InstallComplete", "Install job has completed successfully", pLog)
+	if err == nil {
+		metricClusterProvisionsTotal.WithLabelValues(hivemetrics.GetClusterDeploymentType(instance), resultSuccess).Inc()
+	}
+	return result, err
 }
 
 func (r *ReconcileClusterProvision) reconcileFailedJob(instance *hivev1.ClusterProvision, job *batchv1.Job, pLog log.FieldLogger) (reconcile.Result, error) {
 	pLog.Info("install job failed")
 	reason, message := r.parseInstallLog(instance.Spec.InstallLog, pLog)
-	// Increment a counter metric for this cluster type and error reason:
-	metricInstallErrors.WithLabelValues(hivemetrics.GetClusterDeploymentType(instance), reason).Inc()
-	return r.transitionStage(instance, hivev1.ClusterProvisionStageFailed, reason, message, pLog)
+	result, err := r.transitionStage(instance, hivev1.ClusterProvisionStageFailed, reason, message, pLog)
+	if err == nil {
+		// Increment a counter metric for this cluster type and error reason:
+		metricInstallErrors.WithLabelValues(hivemetrics.GetClusterDeploymentType(instance), reason).Inc()
+		metricClusterProvisionsTotal.WithLabelValues(hivemetrics.GetClusterDeploymentType(instance), resultFailure).Inc()
+	}
+	return result, err
 }
 
 func (r *ReconcileClusterProvision) startProvisioning(instance *hivev1.ClusterProvision, pLog log.FieldLogger) (reconcile.Result, error) {
@@ -304,7 +404,7 @@ func (r *ReconcileClusterProvision) abortProvision(instance *hivev1.ClusterProvi
 	if instance.Status.JobRef == nil {
 		return r.transitionStage(instance, hivev1.ClusterProvisionStageFailed, reason, message, pLog)
 	}
-	if err := r.setCondition(instance, hivev1.ClusterProvisionFailedCondition, reason, message, pLog); err != nil {
+	if err := r.setCondition(instance, hivev1.ClusterProvisionFailedCondition, corev1.ConditionTrue, reason, message, controllerutils.UpdateConditionAlways, pLog); err != nil {
 		return reconcile.Result{}, err
 	}
 	job := &batchv1.Job{}
@@ -344,7 +444,7 @@ func (r *ReconcileClusterProvision) transitionStage(
 	default:
 		return reconcile.Result{}, errors.New("unknown stage")
 	}
-	if err := r.setCondition(instance, conditionType, reason, message, pLog); err != nil {
+	if err := r.setCondition(instance, conditionType, corev1.ConditionTrue, reason, message, controllerutils.UpdateConditionAlways, pLog); err != nil {
 		return reconcile.Result{}, err
 	}
 	if err := r.setStage(instance, stage, pLog); err != nil {
@@ -356,17 +456,19 @@ func (r *ReconcileClusterProvision) transitionStage(
 func (r *ReconcileClusterProvision) setCondition(
 	instance *hivev1.ClusterProvision,
 	conditionType hivev1.ClusterProvisionConditionType,
+	status corev1.ConditionStatus,
 	reason string,
 	message string,
+	updateConditionCheck controllerutils.UpdateConditionCheck,
 	pLog log.FieldLogger,
 ) error {
 	instance.Status.Conditions = controllerutils.SetClusterProvisionCondition(
 		instance.Status.Conditions,
 		conditionType,
-		corev1.ConditionTrue,
+		status,
 		reason,
 		message,
-		controllerutils.UpdateConditionAlways,
+		updateConditionCheck,
 	)
 	if err := r.Status().Update(context.TODO(), instance); err != nil {
 		pLog.WithError(err).Error("cannot update status conditions")
@@ -422,4 +524,60 @@ func clusterDeploymentWatchHandler(a handler.MapObject) []reconcile.Request {
 			},
 		},
 	}
+}
+
+func generateOwnershipUniqueKeys(owner hivev1.MetaRuntimeObject) []*controllerutils.OwnershipUniqueKey {
+	return []*controllerutils.OwnershipUniqueKey{
+		{
+			TypeToList: &batchv1.JobList{},
+			LabelSelector: map[string]string{
+				constants.ClusterProvisionNameLabel: owner.GetName(),
+				constants.JobTypeLabel:              constants.JobTypeProvision,
+			},
+			Controlled: true,
+		},
+		{
+			TypeToList: &corev1.SecretList{},
+			LabelSelector: map[string]string{
+				constants.ClusterProvisionNameLabel: owner.GetName(),
+				constants.SecretTypeLabel:           constants.SecretTypeKubeConfig,
+			},
+			Controlled: false,
+		},
+		{
+			TypeToList: &corev1.SecretList{},
+			LabelSelector: map[string]string{
+				constants.ClusterProvisionNameLabel: owner.GetName(),
+				constants.SecretTypeLabel:           constants.SecretTypeKubeAdminCreds,
+			},
+			Controlled: false,
+		},
+	}
+}
+
+// deleteInstallJob deletes the install job of a successful provision
+func (r *ReconcileClusterProvision) deleteInstallJob(provision *hivev1.ClusterProvision, pLog log.FieldLogger) (reconcile.Result, error) {
+	pLog.Info("deleting successful install job")
+	job := &batchv1.Job{}
+	switch err := r.Get(context.TODO(), types.NamespacedName{Name: provision.Status.JobRef.Name, Namespace: provision.Namespace}, job); {
+	case apierrors.IsNotFound(err):
+		pLog.Info("install job has already been deleted")
+	case err != nil:
+		pLog.WithError(err).Log(controllerutils.LogLevel(err), "could not get install job")
+		return reconcile.Result{}, err
+	default:
+		// deleting install job with background propagation policy to cascade delete install pod
+		if err := r.Delete(context.TODO(), job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
+			pLog.WithField("job", job.Name).WithError(err).Log(controllerutils.LogLevel(err), "error deleting successful install job")
+			return reconcile.Result{}, err
+		}
+	}
+	// clearing job reference after the install job has been deleted
+	pLog.Info("clearing job reference after the install job has been deleted")
+	provision.Status.JobRef = nil
+	if err := r.Status().Update(context.TODO(), provision); err != nil {
+		pLog.WithError(err).Log(controllerutils.LogLevel(err), "error clearing job reference after the install job has been deleted")
+		return reconcile.Result{}, err
+	}
+	return reconcile.Result{}, nil
 }

@@ -7,19 +7,24 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"google.golang.org/api/cloudresourcemanager/v1"
 	compute "google.golang.org/api/compute/v1"
 	dns "google.golang.org/api/dns/v1"
 	"google.golang.org/api/option"
+	"google.golang.org/api/serviceusage/v1"
 )
 
-//go:generate mockgen -source=./client.go -destination=.mock/gcpclient_generated.go -package=mock
+//go:generate mockgen -source=./client.go -destination=./mock/gcpclient_generated.go -package=mock
 
 // API represents the calls made to the API.
 type API interface {
 	GetNetwork(ctx context.Context, network, project string) (*compute.Network, error)
 	GetPublicDomains(ctx context.Context, project string) ([]string, error)
-	GetPublicDNSZone(ctx context.Context, baseDomain, project string) (*dns.ManagedZone, error)
+	GetPublicDNSZone(ctx context.Context, project, baseDomain string) (*dns.ManagedZone, error)
 	GetSubnetworks(ctx context.Context, network, project, region string) ([]*compute.Subnetwork, error)
+	GetProjects(ctx context.Context) (map[string]string, error)
+	GetRecordSets(ctx context.Context, project, zone string) ([]*dns.ResourceRecordSet, error)
+	GetEnabledServices(ctx context.Context, project string) ([]string, error)
 }
 
 // Client makes calls to the GCP API.
@@ -93,7 +98,9 @@ func (c *Client) GetPublicDNSZone(ctx context.Context, project, baseDomain strin
 	if err != nil {
 		return nil, err
 	}
-
+	if !strings.HasSuffix(baseDomain, ".") {
+		baseDomain = fmt.Sprintf("%s.", baseDomain)
+	}
 	req := svc.ManagedZones.List(project).DnsName(baseDomain).Context(ctx)
 	var res *dns.ManagedZone
 	if err := req.Pages(ctx, func(page *dns.ManagedZonesListResponse) error {
@@ -112,6 +119,27 @@ func (c *Client) GetPublicDNSZone(ctx context.Context, project, baseDomain strin
 	return res, nil
 }
 
+// GetRecordSets returns all the records for a DNS zone.
+func (c *Client) GetRecordSets(ctx context.Context, project, zone string) ([]*dns.ResourceRecordSet, error) {
+	ctx, cancel := context.WithTimeout(context.TODO(), 1*time.Minute)
+	defer cancel()
+
+	svc, err := c.getDNSService(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	req := svc.ResourceRecordSets.List(project, zone).Context(ctx)
+	var rrSets []*dns.ResourceRecordSet
+	if err := req.Pages(ctx, func(page *dns.ResourceRecordSetsListResponse) error {
+		rrSets = append(rrSets, page.Rrsets...)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return rrSets, nil
+}
+
 // GetSubnetworks uses the GCP Compute Service API to retrieve all subnetworks in a given network.
 func (c *Client) GetSubnetworks(ctx context.Context, network, project, region string) ([]*compute.Subnetwork, error) {
 	ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
@@ -126,9 +154,7 @@ func (c *Client) GetSubnetworks(ctx context.Context, network, project, region st
 	req := svc.Subnetworks.List(project, region).Filter(filter)
 	var res []*compute.Subnetwork
 	if err := req.Pages(ctx, func(page *compute.SubnetworkList) error {
-		for _, subnet := range page.Items {
-			res = append(res, subnet)
-		}
+		res = append(res, page.Items...)
 		return nil
 	}); err != nil {
 		return nil, err
@@ -148,6 +174,73 @@ func (c *Client) getDNSService(ctx context.Context) (*dns.Service, error) {
 	svc, err := dns.NewService(ctx, option.WithCredentials(c.ssn.Credentials))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create dns service")
+	}
+	return svc, nil
+}
+
+// GetProjects gets the list of project names and ids associated with the current user in the form
+// of a map whose keys are ids and values are names.
+func (c *Client) GetProjects(ctx context.Context) (map[string]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
+	svc, err := c.getCloudResourceService(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	req := svc.Projects.List()
+	projects := make(map[string]string)
+	if err := req.Pages(ctx, func(page *cloudresourcemanager.ListProjectsResponse) error {
+		for _, project := range page.Projects {
+			projects[project.ProjectId] = project.Name
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return projects, nil
+}
+
+func (c *Client) getCloudResourceService(ctx context.Context) (*cloudresourcemanager.Service, error) {
+	svc, err := cloudresourcemanager.NewService(ctx, option.WithCredentials(c.ssn.Credentials))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create cloud resource service")
+	}
+	return svc, nil
+}
+
+// GetEnabledServices gets the list of enabled services for a project.
+func (c *Client) GetEnabledServices(ctx context.Context, project string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	defer cancel()
+
+	svc, err := c.getServiceUsageService(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// List accepts a parent, which includes the type of resource with the id.
+	parent := fmt.Sprintf("projects/%s", project)
+	req := svc.Services.List(parent).Filter("state:ENABLED")
+	var services []string
+	if err := req.Pages(ctx, func(page *serviceusage.ListServicesResponse) error {
+		for _, service := range page.Services {
+			//services are listed in the form of project/services/serviceName
+			index := strings.LastIndex(service.Name, "/")
+			services = append(services, service.Name[index+1:])
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return services, nil
+}
+
+func (c *Client) getServiceUsageService(ctx context.Context) (*serviceusage.Service, error) {
+	svc, err := serviceusage.NewService(ctx, option.WithCredentials(c.ssn.Credentials))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create service usage service")
 	}
 	return svc, nil
 }

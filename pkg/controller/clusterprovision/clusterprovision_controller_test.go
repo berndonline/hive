@@ -2,7 +2,9 @@ package clusterprovision
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
@@ -27,13 +29,17 @@ import (
 	"github.com/openshift/hive/pkg/constants"
 	controllerutils "github.com/openshift/hive/pkg/controller/utils"
 	"github.com/openshift/hive/pkg/install"
+	testgeneric "github.com/openshift/hive/pkg/test/generic"
+	testjob "github.com/openshift/hive/pkg/test/job"
 )
 
 const (
-	testDeploymentName = "test-deployment-name"
-	testProvisionName  = "test-provision-name"
-	installJobName     = "test-provision-name-provision"
-	testNamespace      = "test-namespace"
+	testDeploymentName    = "test-deployment-name"
+	testProvisionName     = "test-provision-name"
+	installJobName        = "test-provision-name-provision"
+	testNamespace         = "test-namespace"
+	controllerUidLabelKey = "controller-uid"
+	testControllerUid     = "test-controller-uid"
 )
 
 func init() {
@@ -46,17 +52,17 @@ func TestClusterProvisionReconcile(t *testing.T) {
 	routev1.Install(scheme.Scheme)
 
 	tests := []struct {
-		name                    string
-		existing                []runtime.Object
-		pendingCreation         bool
-		expectedReconcileResult reconcile.Result
-		expectErr               bool
-		expectedStage           hivev1.ClusterProvisionStage
-		expectedFailReason      string
-		expectNoJob             bool
-		expectNoJobReference    bool
-		expectPendingCreation   bool
-		validate                func(client.Client, *testing.T)
+		name                  string
+		existing              []runtime.Object
+		pendingCreation       bool
+		expectErr             bool
+		expectedStage         hivev1.ClusterProvisionStage
+		expectedFailReason    string
+		expectNoJob           bool
+		expectNoJobReference  bool
+		expectPendingCreation bool
+		validateRequeueAfter  func(time.Duration, client.Client, *testing.T)
+		validate              func(client.Client, *testing.T)
 	}{
 		{
 			name: "create job",
@@ -98,6 +104,7 @@ func TestClusterProvisionReconcile(t *testing.T) {
 			existing: []runtime.Object{
 				testProvision(withJob()),
 				testJob(),
+				testPod("foo", running()),
 			},
 			expectedStage: hivev1.ClusterProvisionStageInitializing,
 		},
@@ -106,6 +113,7 @@ func TestClusterProvisionReconcile(t *testing.T) {
 			existing: []runtime.Object{
 				testProvision(withJob(), provisioning()),
 				testJob(completed()),
+				testPod("foo", success()),
 			},
 			expectedStage: hivev1.ClusterProvisionStageComplete,
 		},
@@ -114,6 +122,7 @@ func TestClusterProvisionReconcile(t *testing.T) {
 			existing: []runtime.Object{
 				testProvision(withJob()),
 				testJob(completed()),
+				testPod("foo", success()),
 			},
 			expectedStage:      hivev1.ClusterProvisionStageFailed,
 			expectedFailReason: "InitializationNotComplete",
@@ -123,17 +132,34 @@ func TestClusterProvisionReconcile(t *testing.T) {
 			existing: []runtime.Object{
 				testProvision(withJob()),
 				testJob(failedJob()),
+				testPod("foo"),
 			},
 			expectedStage:      hivev1.ClusterProvisionStageFailed,
 			expectedFailReason: unknownReason,
 		},
 		{
-			name: "keep job after success",
+			name: "keep job for 24 hours after success",
 			existing: []runtime.Object{
-				testProvision(succeeded(), withJob()),
+				testProvision(succeeded(), withJob(), withCreationTime(time.Now())),
 				testJob(),
 			},
+			validateRequeueAfter: func(requeueAfter time.Duration, c client.Client, t *testing.T) {
+				testProvisionCreationTime := getProvision(c).CreationTimestamp.Time
+				assert.Less(t, requeueAfter.Nanoseconds(), 24*time.Hour.Nanoseconds(), "unexpected requeue after duration")
+				assert.Greater(t, requeueAfter.Nanoseconds(), testProvisionCreationTime.Add(24*time.Hour).Sub(time.Now()).Nanoseconds(),
+					"unexpected requeue after duration")
+			},
 			expectedStage: hivev1.ClusterProvisionStageComplete,
+		},
+		{
+			name: "removed job 24 hours after success",
+			existing: []runtime.Object{
+				testProvision(succeeded(), withJob(), withCreationTime(time.Now().Add(-24*time.Hour))),
+				testJob(),
+			},
+			expectedStage:        hivev1.ClusterProvisionStageComplete,
+			expectNoJob:          true,
+			expectNoJobReference: true,
 		},
 		{
 			name: "keep job after failure",
@@ -171,6 +197,53 @@ func TestClusterProvisionReconcile(t *testing.T) {
 			expectedFailReason: "test-reason",
 			expectNoJob:        true,
 		},
+		{
+			name: "no install pod running after starting install job",
+			existing: []runtime.Object{
+				testProvision(withJob()),
+				testJob(withCreationTimestamp(time.Now().Add(-podStatusCheckDelay))),
+			},
+			expectedStage: hivev1.ClusterProvisionStageInitializing,
+			validate: func(c client.Client, t *testing.T) {
+				provision := getProvision(c)
+				require.NotNil(t, provision, "could not get ClusterProvision")
+				assertConditionStatus(t, provision, hivev1.InstallPodStuckCondition, corev1.ConditionTrue)
+				assertConditionReason(t, provision, hivev1.InstallPodStuckCondition, "InstallPodMissing")
+			},
+			expectErr: true,
+		},
+		{
+			name: "multiple install pods running after starting install job",
+			existing: []runtime.Object{
+				testProvision(withJob()),
+				testJob(withCreationTimestamp(time.Now().Add(-podStatusCheckDelay))),
+				testPod("foo", running()),
+				testPod("bar", running()),
+			},
+			expectedStage: hivev1.ClusterProvisionStageInitializing,
+			validate: func(c client.Client, t *testing.T) {
+				provision := getProvision(c)
+				require.NotNil(t, provision, "could not get ClusterProvision")
+				assertConditionStatus(t, provision, hivev1.InstallPodStuckCondition, corev1.ConditionTrue)
+				assertConditionReason(t, provision, hivev1.InstallPodStuckCondition, "InstallPodMissing")
+			},
+			expectErr: true,
+		},
+		{
+			name: "install pod is stuck in pending phase",
+			existing: []runtime.Object{
+				testProvision(withJob()),
+				testJob(withCreationTimestamp(time.Now().Add(-podStatusCheckDelay))),
+				testPod("foo", pending()),
+			},
+			expectedStage: hivev1.ClusterProvisionStageInitializing,
+			validate: func(c client.Client, t *testing.T) {
+				provision := getProvision(c)
+				require.NotNil(t, provision, "could not get ClusterProvision")
+				assertConditionStatus(t, provision, hivev1.InstallPodStuckCondition, corev1.ConditionTrue)
+				assertConditionReason(t, provision, hivev1.InstallPodStuckCondition, "PodInPendingPhase")
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -198,7 +271,9 @@ func TestClusterProvisionReconcile(t *testing.T) {
 
 			result, err := rcp.Reconcile(reconcileRequest)
 
-			assert.Equal(t, test.expectedReconcileResult, result, "unexpected reconcile result")
+			if test.validateRequeueAfter != nil {
+				test.validateRequeueAfter(result.RequeueAfter, fakeClient, t)
+			}
 
 			if test.expectErr {
 				assert.Error(t, err, "expected error from reconcile")
@@ -295,6 +370,12 @@ func withJob() provisionOption {
 	}
 }
 
+func withCreationTime(creationTime time.Time) provisionOption {
+	return func(p *hivev1.ClusterProvision) {
+		p.CreationTimestamp.Time = creationTime
+	}
+}
+
 func withFailedCondition(reason string) provisionOption {
 	return func(p *hivev1.ClusterProvision) {
 		p.Status.Conditions = append(
@@ -308,15 +389,16 @@ func withFailedCondition(reason string) provisionOption {
 	}
 }
 
-type jobOption func(*batchv1.Job)
-
-func testJob(opts ...jobOption) *batchv1.Job {
+func testJob(opts ...testjob.Option) *batchv1.Job {
 	provision := testProvision()
 	job, err := install.GenerateInstallerJob(provision)
 	if err != nil {
 		panic("should not error while generating test install job")
 	}
 	job.Labels[clusterProvisionLabelKey] = provision.Name
+	job.Spec.Selector = &metav1.LabelSelector{
+		MatchLabels: map[string]string{controllerUidLabelKey: testControllerUid},
+	}
 
 	controllerutil.SetControllerReference(provision, job, scheme.Scheme)
 
@@ -327,7 +409,7 @@ func testJob(opts ...jobOption) *batchv1.Job {
 	return job
 }
 
-func completed() jobOption {
+func completed() testjob.Option {
 	return func(job *batchv1.Job) {
 		job.Status.Conditions = append(job.Status.Conditions,
 			batchv1.JobCondition{
@@ -338,7 +420,7 @@ func completed() jobOption {
 	}
 }
 
-func failedJob() jobOption {
+func failedJob() testjob.Option {
 	return func(job *batchv1.Job) {
 		job.Status.Conditions = append(job.Status.Conditions,
 			batchv1.JobCondition{
@@ -347,6 +429,10 @@ func failedJob() jobOption {
 			},
 		)
 	}
+}
+
+func withCreationTimestamp(time time.Time) testjob.Option {
+	return testjob.Generic(testgeneric.WithCreationTimestamp(time))
 }
 
 func getJob(c client.Client) *batchv1.Job {
@@ -364,4 +450,62 @@ func getProvision(c client.Client) *hivev1.ClusterProvision {
 		return nil
 	}
 	return provision
+}
+
+type podOption func(*corev1.Pod)
+
+func testPod(nameSuffix string, opts ...podOption) *corev1.Pod {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-%s", testJob().Name, nameSuffix),
+			Namespace: testNamespace,
+			Labels: map[string]string{
+				controllerUidLabelKey: testControllerUid,
+			},
+		},
+	}
+
+	for _, o := range opts {
+		o(pod)
+	}
+
+	return pod
+}
+
+func pending() podOption {
+	return func(pod *corev1.Pod) {
+		pod.Status.Phase = "Pending"
+	}
+}
+
+func running() podOption {
+	return func(pod *corev1.Pod) {
+		pod.Status.Phase = "Running"
+	}
+}
+
+func success() podOption {
+	return func(pod *corev1.Pod) {
+		pod.Status.Phase = "Succeeded"
+	}
+}
+
+func assertConditionStatus(t *testing.T, provision *hivev1.ClusterProvision, condType hivev1.ClusterProvisionConditionType, status corev1.ConditionStatus) {
+	for _, cond := range provision.Status.Conditions {
+		if cond.Type == condType {
+			assert.Equal(t, string(status), string(cond.Status), "condition found with unexpected status")
+			return
+		}
+	}
+	t.Errorf("did not find expected condition type: %v", condType)
+}
+
+func assertConditionReason(t *testing.T, cd *hivev1.ClusterProvision, condType hivev1.ClusterProvisionConditionType, reason string) {
+	for _, cond := range cd.Status.Conditions {
+		if cond.Type == condType {
+			assert.Equal(t, reason, cond.Reason, "condition found with unexpected reason")
+			return
+		}
+	}
+	t.Errorf("did not find expected condition type: %v", condType)
 }

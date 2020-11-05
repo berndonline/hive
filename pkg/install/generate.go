@@ -8,6 +8,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/pointer"
 
@@ -18,32 +19,28 @@ import (
 )
 
 const (
-	// DefaultInstallerImage is the image that will be used to install a ClusterDeployment if no
-	// image is specified through a ClusterImageSet reference or on the ClusterDeployment itself.
-	DefaultInstallerImage = "registry.svc.ci.openshift.org/openshift/origin-v4.0:installer"
-
-	tryUninstallOnceAnnotation = "hive.openshift.io/try-uninstall-once"
-	azureAuthDir               = "/.azure"
-	azureAuthFile              = azureAuthDir + "/osServicePrincipal.json"
-	gcpAuthDir                 = "/.gcp"
-	gcpAuthFile                = gcpAuthDir + "/" + constants.GCPCredentialsName
+	azureAuthDir       = "/.azure"
+	azureAuthFile      = azureAuthDir + "/osServicePrincipal.json"
+	gcpAuthDir         = "/.gcp"
+	gcpAuthFile        = gcpAuthDir + "/" + constants.GCPCredentialsName
+	openStackCloudsDir = "/etc/openstack"
+	vsphereCloudsDir   = "/vsphere"
+	ovirtCloudsDir     = "/.ovirt"
+	ovirtCADir         = "/.ovirt-ca"
 
 	// SSHPrivateKeyDir is the directory where the generated Job will mount the ssh secret to
 	SSHPrivateKeyDir = "/sshkeys"
 
 	// LibvirtSSHPrivateKeyDir is the directory where the generated Job will mount the libvirt ssh secret to
 	LibvirtSSHPrivateKeyDir = "/libvirtsshkeys"
-
-	// SSHSecretPrivateKeyName is the key name holding the private key in the SSH secret
-	SSHSecretPrivateKeyName = "ssh-privatekey"
 )
 
 var (
 	// SSHPrivateKeyFilePath is the path to the private key contents (from the SSH secret)
-	SSHPrivateKeyFilePath = fmt.Sprintf("%s/%s", SSHPrivateKeyDir, SSHSecretPrivateKeyName)
+	SSHPrivateKeyFilePath = fmt.Sprintf("%s/%s", SSHPrivateKeyDir, constants.SSHPrivateKeySecretKey)
 
 	// LibvirtSSHPrivateKeyFilePath is the path to the private key contents (from the libvirt SSH secret)
-	LibvirtSSHPrivateKeyFilePath = fmt.Sprintf("%s/%s", LibvirtSSHPrivateKeyDir, SSHSecretPrivateKeyName)
+	LibvirtSSHPrivateKeyFilePath = fmt.Sprintf("%s/%s", LibvirtSSHPrivateKeyDir, constants.SSHPrivateKeySecretKey)
 )
 
 // InstallerPodSpec generates a spec for an installer pod.
@@ -54,6 +51,7 @@ func InstallerPodSpec(
 	serviceAccountName string,
 	pvcName string,
 	skipGatherLogs bool,
+	extraEnvVars []corev1.EnvVar,
 ) (*corev1.PodSpec, error) {
 
 	if cd.Spec.Provisioning == nil {
@@ -75,6 +73,9 @@ func InstallerPodSpec(
 			Value: "hive",
 		},
 	}
+
+	env = append(env, extraEnvVars...)
+
 	volumes := []corev1.Volume{
 		{
 			Name: "output",
@@ -123,7 +124,7 @@ func InstallerPodSpec(
 				ValueFrom: &corev1.EnvVarSource{
 					SecretKeyRef: &corev1.SecretKeySelector{
 						LocalObjectReference: cd.Spec.Platform.AWS.CredentialsSecretRef,
-						Key:                  "aws_access_key_id",
+						Key:                  constants.AWSAccessKeyIDSecretKey,
 					},
 				},
 			},
@@ -132,7 +133,7 @@ func InstallerPodSpec(
 				ValueFrom: &corev1.EnvVarSource{
 					SecretKeyRef: &corev1.SecretKeySelector{
 						LocalObjectReference: cd.Spec.Platform.AWS.CredentialsSecretRef,
-						Key:                  "aws_secret_access_key",
+						Key:                  constants.AWSSecretAccessKeySecretKey,
 					},
 				},
 			},
@@ -171,6 +172,63 @@ func InstallerPodSpec(
 			Name:  "GOOGLE_CREDENTIALS",
 			Value: gcpAuthFile,
 		})
+	case cd.Spec.Platform.OpenStack != nil:
+		volumes = append(volumes, corev1.Volume{
+			Name: "openstack",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: cd.Spec.Platform.OpenStack.CredentialsSecretRef.Name,
+				},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "openstack",
+			MountPath: openStackCloudsDir,
+		})
+	case cd.Spec.Platform.VSphere != nil:
+		volumes = append(volumes, corev1.Volume{
+			Name: "vsphere-certificates",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: cd.Spec.Platform.VSphere.CertificatesSecretRef.Name,
+				},
+			},
+		})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "vsphere-certificates",
+			MountPath: vsphereCloudsDir,
+		})
+		env = append(env, vSphereCredsEnvVars(cd.Spec.Platform.VSphere.CredentialsSecretRef.Name)...)
+	case cd.Spec.Platform.Ovirt != nil:
+		volumes = append(volumes,
+			corev1.Volume{
+				Name: "ovirt-credentials",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: cd.Spec.Platform.Ovirt.CredentialsSecretRef.Name,
+					},
+				},
+			},
+			corev1.Volume{
+				Name: "ovirt-certificates",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: cd.Spec.Platform.Ovirt.CertificatesSecretRef.Name,
+					},
+				},
+			},
+		)
+		volumeMounts = append(volumeMounts,
+			corev1.VolumeMount{
+				Name:      "ovirt-credentials",
+				MountPath: ovirtCloudsDir,
+			},
+			corev1.VolumeMount{
+				Name:      "ovirt-certificates",
+				MountPath: ovirtCADir,
+			},
+		)
+		env = append(env, oVirtCredsEnvVars(cd.Spec.Platform.Ovirt.CredentialsSecretRef.Name)...)
 	}
 
 	if releaseImage != "" {
@@ -276,13 +334,27 @@ func InstallerPodSpec(
 	}
 	cliImage := *cd.Status.CLIImage
 
+	hiveArg := fmt.Sprintf("/usr/bin/hiveutil install-manager --work-dir /output --log-level debug %s %s", cd.Namespace, provisionName)
+	if cd.Spec.Platform.VSphere != nil {
+		// Add vSphere certificates to CA trust.
+		hiveArg = fmt.Sprintf("cp -vr %s/. /etc/pki/ca-trust/source/anchors/ && update-ca-trust && %s", vsphereCloudsDir, hiveArg)
+	}
+	if cd.Spec.Platform.Ovirt != nil {
+		// Add oVirt certificates to CA trust.
+		hiveArg = fmt.Sprintf("cp -vr %s/. /etc/pki/ca-trust/source/anchors/ && update-ca-trust && %s", ovirtCADir, hiveArg)
+	}
+
+	// This is used when scheduling the installer pod. It ensures that installer pods don't overwhelm
+	// a given node's memory.
+	memoryRequest := resource.MustParse("800Mi")
+
 	// This container just needs to copy the required install binaries to the shared emptyDir volume,
 	// where our container will run them. This is effectively downloading the all-in-one installer.
 	containers := []corev1.Container{
 		{
 			Name:            "installer",
 			Image:           installerImage,
-			ImagePullPolicy: corev1.PullAlways,
+			ImagePullPolicy: corev1.PullIfNotPresent,
 			Env:             env,
 			Command:         []string{"/bin/sh", "-c"},
 			// Large file copy here has shown to cause problems in clusters under load, safer to copy then rename to the file the install manager is waiting for
@@ -293,7 +365,7 @@ func InstallerPodSpec(
 		{
 			Name:            "cli",
 			Image:           cliImage,
-			ImagePullPolicy: corev1.PullAlways,
+			ImagePullPolicy: corev1.PullIfNotPresent,
 			Env:             env,
 			Command:         []string{"/bin/sh", "-c"},
 			// Large file copy here has shown to cause problems in clusters under load, safer to copy then rename to the file the install manager is waiting for
@@ -306,13 +378,14 @@ func InstallerPodSpec(
 			Image:           images.GetHiveImage(),
 			ImagePullPolicy: images.GetHiveImagePullPolicy(),
 			Env:             append(env, cd.Spec.Provisioning.InstallerEnv...),
-			Command:         []string{"/usr/bin/hiveutil"},
-			Args: []string{"install-manager",
-				"--work-dir", "/output",
-				"--log-level", "debug",
-				cd.Namespace, provisionName,
+			Command:         []string{"/bin/sh", "-c"},
+			Args:            []string{hiveArg},
+			VolumeMounts:    volumeMounts,
+			Resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceMemory: memoryRequest,
+				},
 			},
-			VolumeMounts: volumeMounts,
 		},
 	}
 
@@ -378,16 +451,7 @@ func GetUninstallJobName(name string) string {
 func GenerateUninstallerJobForDeprovision(
 	req *hivev1.ClusterDeprovision) (*batchv1.Job, error) {
 
-	tryOnce := false
-	if req.Annotations != nil {
-		value, exists := req.Annotations[tryUninstallOnceAnnotation]
-		tryOnce = exists && value == "true"
-	}
-
 	restartPolicy := corev1.RestartPolicyOnFailure
-	if tryOnce {
-		restartPolicy = corev1.RestartPolicyNever
-	}
 
 	podSpec := corev1.PodSpec{
 		DNSPolicy:     corev1.DNSClusterFirst,
@@ -410,6 +474,9 @@ func GenerateUninstallerJobForDeprovision(
 		Completions:  &completions,
 		BackoffLimit: &backoffLimit,
 		Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: labels,
+			},
 			Spec: podSpec,
 		},
 	}
@@ -421,6 +488,12 @@ func GenerateUninstallerJobForDeprovision(
 		completeAzureDeprovisionJob(req, job)
 	case req.Spec.Platform.GCP != nil:
 		completeGCPDeprovisionJob(req, job)
+	case req.Spec.Platform.OpenStack != nil:
+		completeOpenStackDeprovisionJob(req, job)
+	case req.Spec.Platform.VSphere != nil:
+		completeVSphereDeprovisionJob(req, job)
+	case req.Spec.Platform.Ovirt != nil:
+		completeOvirtDeprovisionJob(req, job)
 	default:
 		return nil, errors.New("deprovision requests currently not supported for platform")
 	}
@@ -433,36 +506,11 @@ func completeAWSDeprovisionJob(req *hivev1.ClusterDeprovision, job *batchv1.Job)
 	if len(req.Spec.Platform.AWS.CredentialsSecretRef.Name) > 0 {
 		credentialsSecret = req.Spec.Platform.AWS.CredentialsSecretRef.Name
 	}
-	env := []corev1.EnvVar{}
-	if len(credentialsSecret) > 0 {
-		env = append(
-			env,
-			corev1.EnvVar{
-				Name: "AWS_ACCESS_KEY_ID",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: credentialsSecret},
-						Key:                  "aws_access_key_id",
-					},
-				},
-			},
-			corev1.EnvVar{
-				Name: "AWS_SECRET_ACCESS_KEY",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: credentialsSecret},
-						Key:                  "aws_secret_access_key",
-					},
-				},
-			},
-		)
-	}
 	containers := []corev1.Container{
 		{
 			Name:            "deprovision",
 			Image:           images.GetHiveImage(),
 			ImagePullPolicy: images.GetHiveImagePullPolicy(),
-			Env:             env,
 			Command:         []string{"/usr/bin/hiveutil"},
 			Args: []string{
 				"aws-tag-deprovision",
@@ -479,6 +527,24 @@ func completeAWSDeprovisionJob(req *hivev1.ClusterDeprovision, job *batchv1.Job)
 		containers[0].Args = append(containers[0].Args, fmt.Sprintf("openshiftClusterID=%s", req.Spec.ClusterID))
 	}
 	job.Spec.Template.Spec.Containers = containers
+	if len(credentialsSecret) > 0 {
+		containers[0].VolumeMounts = []corev1.VolumeMount{
+			{
+				Name:      "aws-creds",
+				MountPath: constants.AWSCredsMount,
+			},
+		}
+		job.Spec.Template.Spec.Volumes = []corev1.Volume{
+			{
+				Name: "aws-creds",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: credentialsSecret,
+					},
+				},
+			},
+		}
+	}
 }
 
 func completeAzureDeprovisionJob(req *hivev1.ClusterDeprovision, job *batchv1.Job) {
@@ -513,6 +579,8 @@ func completeAzureDeprovisionJob(req *hivev1.ClusterDeprovision, job *batchv1.Jo
 				"azure",
 				"--loglevel",
 				"debug",
+				"--creds-dir",
+				azureAuthDir,
 				req.Spec.InfraID,
 			},
 			VolumeMounts: volumeMounts,
@@ -555,6 +623,8 @@ func completeGCPDeprovisionJob(req *hivev1.ClusterDeprovision, job *batchv1.Job)
 				"gcp",
 				"--loglevel",
 				"debug",
+				"--creds-dir",
+				gcpAuthDir,
 				"--region",
 				req.Spec.Platform.GCP.Region,
 				req.Spec.InfraID,
@@ -564,4 +634,202 @@ func completeGCPDeprovisionJob(req *hivev1.ClusterDeprovision, job *batchv1.Job)
 	}
 	job.Spec.Template.Spec.Containers = containers
 	job.Spec.Template.Spec.Volumes = volumes
+}
+
+func completeOpenStackDeprovisionJob(req *hivev1.ClusterDeprovision, job *batchv1.Job) {
+	volumes := []corev1.Volume{}
+	volumeMounts := []corev1.VolumeMount{}
+	env := []corev1.EnvVar{}
+	volumes = append(volumes, corev1.Volume{
+		Name: "openstack",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: req.Spec.Platform.OpenStack.CredentialsSecretRef.Name,
+			},
+		},
+	})
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name:      "openstack",
+		MountPath: openStackCloudsDir,
+	})
+	containers := []corev1.Container{
+		{
+			Name:            "deprovision",
+			Image:           images.GetHiveImage(),
+			ImagePullPolicy: images.GetHiveImagePullPolicy(),
+			Env:             env,
+			Command:         []string{"/usr/bin/hiveutil"},
+			Args: []string{
+				"deprovision",
+				"openstack",
+				"--loglevel",
+				"debug",
+				"--creds-dir",
+				openStackCloudsDir,
+				"--cloud",
+				req.Spec.Platform.OpenStack.Cloud,
+				req.Spec.InfraID,
+			},
+			VolumeMounts: volumeMounts,
+		},
+	}
+	job.Spec.Template.Spec.Containers = containers
+	job.Spec.Template.Spec.Volumes = volumes
+}
+
+func completeVSphereDeprovisionJob(req *hivev1.ClusterDeprovision, job *batchv1.Job) {
+	const vsphereCredsDir = "/vsphere-creds"
+	volumes := []corev1.Volume{}
+	volumeMounts := []corev1.VolumeMount{}
+	volumes = append(volumes,
+		corev1.Volume{
+			Name: "vsphere-creds",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: req.Spec.Platform.VSphere.CredentialsSecretRef.Name,
+				},
+			},
+		},
+		corev1.Volume{
+			Name: "vsphere-certificates",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: req.Spec.Platform.VSphere.CertificatesSecretRef.Name,
+				},
+			},
+		},
+	)
+	volumeMounts = append(volumeMounts,
+		corev1.VolumeMount{
+			Name:      "vsphere-creds",
+			MountPath: vsphereCredsDir,
+		},
+		corev1.VolumeMount{
+			Name:      "vsphere-certificates",
+			MountPath: vsphereCloudsDir,
+		},
+	)
+
+	env := vSphereCredsEnvVars(req.Spec.Platform.VSphere.CredentialsSecretRef.Name)
+
+	containers := []corev1.Container{
+		{
+			Name:            "deprovision",
+			Image:           images.GetHiveImage(),
+			ImagePullPolicy: images.GetHiveImagePullPolicy(),
+			Env:             env,
+			Command:         []string{"/bin/sh", "-c"},
+			Args: []string{
+				fmt.Sprintf(
+					"cp -vr %s/. /etc/pki/ca-trust/source/anchors/ && "+
+						"update-ca-trust && "+
+						"/usr/bin/hiveutil deprovision vsphere --vsphere-vcenter %s --loglevel debug --creds-dir=%s %s",
+					vsphereCloudsDir,
+					req.Spec.Platform.VSphere.VCenter,
+					vsphereCredsDir,
+					req.Spec.InfraID,
+				),
+			},
+			VolumeMounts: volumeMounts,
+		},
+	}
+	job.Spec.Template.Spec.Containers = containers
+	job.Spec.Template.Spec.Volumes = volumes
+}
+
+func completeOvirtDeprovisionJob(req *hivev1.ClusterDeprovision, job *batchv1.Job) {
+	volumes := []corev1.Volume{}
+	volumeMounts := []corev1.VolumeMount{}
+	volumes = append(volumes,
+		corev1.Volume{
+			Name: "ovirt-credentials",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: req.Spec.Platform.Ovirt.CredentialsSecretRef.Name,
+				},
+			},
+		},
+		corev1.Volume{
+			Name: "ovirt-certificates",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: req.Spec.Platform.Ovirt.CertificatesSecretRef.Name,
+				},
+			},
+		},
+	)
+	volumeMounts = append(volumeMounts,
+		corev1.VolumeMount{
+			Name:      "ovirt-credentials",
+			MountPath: ovirtCloudsDir,
+		},
+		corev1.VolumeMount{
+			Name:      "ovirt-certificates",
+			MountPath: ovirtCADir,
+		},
+	)
+
+	env := oVirtCredsEnvVars(req.Spec.Platform.Ovirt.CredentialsSecretRef.Name)
+
+	containers := []corev1.Container{
+		{
+			Name:            "deprovision",
+			Image:           images.GetHiveImage(),
+			ImagePullPolicy: images.GetHiveImagePullPolicy(),
+			Env:             env,
+			Command:         []string{"/bin/sh", "-c"},
+			Args: []string{
+				fmt.Sprintf(
+					"cp -vr %s/. /etc/pki/ca-trust/source/anchors/ && "+
+						"update-ca-trust && "+
+						"/usr/bin/hiveutil deprovision ovirt --ovirt-cluster-id %s --loglevel debug --certs-dir=%s %s",
+					ovirtCADir,
+					req.Spec.Platform.Ovirt.ClusterID,
+					ovirtCloudsDir,
+					req.Spec.InfraID,
+				),
+			},
+			VolumeMounts: volumeMounts,
+		},
+	}
+	job.Spec.Template.Spec.Containers = containers
+	job.Spec.Template.Spec.Volumes = volumes
+}
+
+func vSphereCredsEnvVars(credentialsSecret string) []corev1.EnvVar {
+	env := []corev1.EnvVar{}
+	env = append(
+		env,
+		corev1.EnvVar{
+			Name: constants.VSphereUsernameEnvVar,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: credentialsSecret},
+					Key:                  constants.UsernameSecretKey,
+				},
+			},
+		},
+		corev1.EnvVar{
+			Name: constants.VSpherePasswordEnvVar,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: credentialsSecret},
+					Key:                  constants.PasswordSecretKey,
+				},
+			},
+		},
+	)
+	return env
+}
+
+func oVirtCredsEnvVars(credentialsSecret string) []corev1.EnvVar {
+	env := []corev1.EnvVar{}
+	env = append(
+		env,
+		corev1.EnvVar{
+			Name:  constants.OvirtConfigEnvVar,
+			Value: ovirtCloudsDir + "/" + constants.OvirtCredentialsName,
+		},
+	)
+	return env
 }

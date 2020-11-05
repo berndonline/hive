@@ -43,7 +43,7 @@ func TestNewAWSActuator(t *testing.T) {
 			// Arrange
 			mocks := setupDefaultMocks(t)
 			expectedAWSActuator := &AWSActuator{
-				logger:  log.WithField("controller", controllerName),
+				logger:  log.WithField("controller", ControllerName),
 				dnsZone: tc.dnsZone,
 			}
 
@@ -81,7 +81,7 @@ func mockAWSZoneExists(expect *mock.MockClientMockRecorder, zone *hivev1.DNSZone
 	expect.GetHostedZone(gomock.Any()).Return(&route53.GetHostedZoneOutput{
 		HostedZone: &route53.HostedZone{
 			Id:   aws.String("1234"),
-			Name: aws.String("blah.example.com"),
+			Name: aws.String("blah.example.com."),
 		},
 	}, nil).Times(1)
 }
@@ -99,7 +99,7 @@ func mockCreateAWSZone(expect *mock.MockClientMockRecorder) {
 	expect.CreateHostedZone(gomock.Any()).Return(&route53.CreateHostedZoneOutput{
 		HostedZone: &route53.HostedZone{
 			Id:   aws.String("1234"),
-			Name: aws.String("blah.example.com"),
+			Name: aws.String("blah.example.com."),
 		},
 	}, nil).Times(1)
 }
@@ -163,7 +163,7 @@ func mockListAWSZonesByNameFound(expect *mock.MockClientMockRecorder, zone *hive
 		HostedZones: []*route53.HostedZone{
 			{
 				Id:              aws.String("1234"),
-				Name:            aws.String("blah.example.com"),
+				Name:            aws.String("blah.example.com."),
 				CallerReference: aws.String(string(zone.UID)),
 			},
 		},
@@ -171,5 +171,19 @@ func mockListAWSZonesByNameFound(expect *mock.MockClientMockRecorder, zone *hive
 }
 
 func mockDeleteAWSZone(expect *mock.MockClientMockRecorder) {
+	expect.ListResourceRecordSets(gomock.Any()).Return(&route53.ListResourceRecordSetsOutput{}, nil).Times(1)
 	expect.DeleteHostedZone(gomock.Any()).Return(nil, nil).Times(1)
+}
+
+func mockGetResourcePages(expect *mock.MockClientMockRecorder) {
+	expect.GetResourcesPages(gomock.Any(), gomock.Any()).Return(nil).Do(func(i *resourcegroupstaggingapi.GetResourcesInput, f func(*resourcegroupstaggingapi.GetResourcesOutput, bool) bool) {
+		getResourcesOutput := &resourcegroupstaggingapi.GetResourcesOutput{
+			ResourceTagMappingList: []*resourcegroupstaggingapi.ResourceTagMapping{
+				{
+					ResourceARN: aws.String("arn:aws:route53:::hostedzone/Z055920326CHQAW0WSG5N"),
+				},
+			},
+		}
+		f(getResourcesOutput, true)
+	})
 }

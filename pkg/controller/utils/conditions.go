@@ -109,6 +109,142 @@ func SetClusterDeploymentConditionWithChangeCheck(
 	return conditions, changed
 }
 
+// SetClusterClaimCondition sets a condition on a ClusterClaim resource's status
+func SetClusterClaimCondition(
+	conditions []hivev1.ClusterClaimCondition,
+	conditionType hivev1.ClusterClaimConditionType,
+	status corev1.ConditionStatus,
+	reason string,
+	message string,
+	updateConditionCheck UpdateConditionCheck,
+) []hivev1.ClusterClaimCondition {
+	newConditions, _ := SetClusterClaimConditionWithChangeCheck(
+		conditions,
+		conditionType,
+		status,
+		reason,
+		message,
+		updateConditionCheck,
+	)
+	return newConditions
+}
+
+// SetClusterClaimConditionWithChangeCheck sets a condition on a ClusterClaim resource's status.
+// It returns the conditions as well a boolean indicating whether there was a change made
+// to the conditions.
+func SetClusterClaimConditionWithChangeCheck(
+	conditions []hivev1.ClusterClaimCondition,
+	conditionType hivev1.ClusterClaimConditionType,
+	status corev1.ConditionStatus,
+	reason string,
+	message string,
+	updateConditionCheck UpdateConditionCheck,
+) ([]hivev1.ClusterClaimCondition, bool) {
+	changed := false
+	now := metav1.Now()
+	existingCondition := FindClusterClaimCondition(conditions, conditionType)
+	if existingCondition == nil {
+		if status == corev1.ConditionTrue {
+			conditions = append(
+				conditions,
+				hivev1.ClusterClaimCondition{
+					Type:               conditionType,
+					Status:             status,
+					Reason:             reason,
+					Message:            message,
+					LastTransitionTime: now,
+					LastProbeTime:      now,
+				},
+			)
+			changed = true
+		}
+	} else {
+		if shouldUpdateCondition(
+			existingCondition.Status, existingCondition.Reason, existingCondition.Message,
+			status, reason, message,
+			updateConditionCheck,
+		) {
+			if existingCondition.Status != status {
+				existingCondition.LastTransitionTime = now
+			}
+			existingCondition.Status = status
+			existingCondition.Reason = reason
+			existingCondition.Message = message
+			existingCondition.LastProbeTime = now
+			changed = true
+		}
+	}
+	return conditions, changed
+}
+
+// SetClusterPoolCondition sets a condition on a ClusterPool resource's status
+func SetClusterPoolCondition(
+	conditions []hivev1.ClusterPoolCondition,
+	conditionType hivev1.ClusterPoolConditionType,
+	status corev1.ConditionStatus,
+	reason string,
+	message string,
+	updateConditionCheck UpdateConditionCheck,
+) []hivev1.ClusterPoolCondition {
+	newConditions, _ := SetClusterPoolConditionWithChangeCheck(
+		conditions,
+		conditionType,
+		status,
+		reason,
+		message,
+		updateConditionCheck,
+	)
+	return newConditions
+}
+
+// SetClusterPoolConditionWithChangeCheck sets a condition on a ClusterPool resource's status.
+// It returns the conditions as well a boolean indicating whether there was a change made
+// to the conditions.
+func SetClusterPoolConditionWithChangeCheck(
+	conditions []hivev1.ClusterPoolCondition,
+	conditionType hivev1.ClusterPoolConditionType,
+	status corev1.ConditionStatus,
+	reason string,
+	message string,
+	updateConditionCheck UpdateConditionCheck,
+) ([]hivev1.ClusterPoolCondition, bool) {
+	changed := false
+	now := metav1.Now()
+	existingCondition := FindClusterPoolCondition(conditions, conditionType)
+	if existingCondition == nil {
+		if status == corev1.ConditionTrue {
+			conditions = append(
+				conditions,
+				hivev1.ClusterPoolCondition{
+					Type:               conditionType,
+					Status:             status,
+					Reason:             reason,
+					Message:            message,
+					LastTransitionTime: now,
+					LastProbeTime:      now,
+				},
+			)
+			changed = true
+		}
+	} else {
+		if shouldUpdateCondition(
+			existingCondition.Status, existingCondition.Reason, existingCondition.Message,
+			status, reason, message,
+			updateConditionCheck,
+		) {
+			if existingCondition.Status != status {
+				existingCondition.LastTransitionTime = now
+			}
+			existingCondition.Status = status
+			existingCondition.Reason = reason
+			existingCondition.Message = message
+			existingCondition.LastProbeTime = now
+			changed = true
+		}
+	}
+	return conditions, changed
+}
+
 // SetClusterProvisionCondition sets a condition on a ClusterProvision resource's status
 func SetClusterProvisionCondition(
 	conditions []hivev1.ClusterProvisionCondition,
@@ -331,9 +467,99 @@ func SetMachinePoolConditionWithChangeCheck(
 	return conditions, changed
 }
 
+// SetClusterDeprovisionCondition sets a condition on a ClusterDeprovision resource's status
+func SetClusterDeprovisionCondition(
+	conditions []hivev1.ClusterDeprovisionCondition,
+	conditionType hivev1.ClusterDeprovisionConditionType,
+	status corev1.ConditionStatus,
+	reason string,
+	message string,
+	updateConditionCheck UpdateConditionCheck,
+) []hivev1.ClusterDeprovisionCondition {
+	newConditions, _ := SetClusterDeprovisionConditionWithChangeCheck(
+		conditions,
+		conditionType,
+		status,
+		reason,
+		message,
+		updateConditionCheck,
+	)
+	return newConditions
+}
+
+// SetClusterDeprovisionConditionWithChangeCheck sets a condition on a ClusterDeprovision resource's status
+// It returns the conditions as well a boolean indicating whether there was a change made
+// to the conditions.
+func SetClusterDeprovisionConditionWithChangeCheck(
+	conditions []hivev1.ClusterDeprovisionCondition,
+	conditionType hivev1.ClusterDeprovisionConditionType,
+	status corev1.ConditionStatus,
+	reason string,
+	message string,
+	updateConditionCheck UpdateConditionCheck,
+) ([]hivev1.ClusterDeprovisionCondition, bool) {
+	changed := false
+	now := metav1.Now()
+	existingCondition := FindClusterDeprovisionCondition(conditions, conditionType)
+	if existingCondition == nil {
+		if status == corev1.ConditionTrue {
+			conditions = append(
+				conditions,
+				hivev1.ClusterDeprovisionCondition{
+					Type:               conditionType,
+					Status:             status,
+					Reason:             reason,
+					Message:            message,
+					LastTransitionTime: now,
+					LastProbeTime:      now,
+				},
+			)
+			changed = true
+		}
+	} else {
+		if shouldUpdateCondition(
+			existingCondition.Status, existingCondition.Reason, existingCondition.Message,
+			status, reason, message,
+			updateConditionCheck,
+		) {
+			if existingCondition.Status != status {
+				existingCondition.LastTransitionTime = now
+			}
+			existingCondition.Status = status
+			existingCondition.Reason = reason
+			existingCondition.Message = message
+			existingCondition.LastProbeTime = now
+			changed = true
+		}
+	}
+	return conditions, changed
+}
+
 // FindClusterDeploymentCondition finds in the condition that has the
 // specified condition type in the given list. If none exists, then returns nil.
 func FindClusterDeploymentCondition(conditions []hivev1.ClusterDeploymentCondition, conditionType hivev1.ClusterDeploymentConditionType) *hivev1.ClusterDeploymentCondition {
+	for i, condition := range conditions {
+		if condition.Type == conditionType {
+			return &conditions[i]
+		}
+	}
+	return nil
+}
+
+// FindClusterClaimCondition finds in the condition that has the
+// specified condition type in the given list. If none exists, then returns nil.
+func FindClusterClaimCondition(conditions []hivev1.ClusterClaimCondition, conditionType hivev1.ClusterClaimConditionType) *hivev1.ClusterClaimCondition {
+	for i, condition := range conditions {
+		if condition.Type == conditionType {
+			return &conditions[i]
+		}
+	}
+	return nil
+}
+
+// FindClusterPoolCondition finds in the condition that has the
+// specified condition type in the given list. If none exists, then returns nil.
+func FindClusterPoolCondition(conditions []hivev1.ClusterPoolCondition, conditionType hivev1.ClusterPoolConditionType) *hivev1.ClusterPoolCondition {
 	for i, condition := range conditions {
 		if condition.Type == conditionType {
 			return &conditions[i]
@@ -378,6 +604,17 @@ func FindDNSZoneCondition(conditions []hivev1.DNSZoneCondition, conditionType hi
 // FindMachinePoolCondition finds in the condition that has the
 // specified condition type in the given list. If none exists, then returns nil.
 func FindMachinePoolCondition(conditions []hivev1.MachinePoolCondition, conditionType hivev1.MachinePoolConditionType) *hivev1.MachinePoolCondition {
+	for i, condition := range conditions {
+		if condition.Type == conditionType {
+			return &conditions[i]
+		}
+	}
+	return nil
+}
+
+// FindClusterDeprovisionCondition finds in the condition that has the
+// specified condition type in the given list. If none exists, then returns nil.
+func FindClusterDeprovisionCondition(conditions []hivev1.ClusterDeprovisionCondition, conditionType hivev1.ClusterDeprovisionConditionType) *hivev1.ClusterDeprovisionCondition {
 	for i, condition := range conditions {
 		if condition.Type == conditionType {
 			return &conditions[i]

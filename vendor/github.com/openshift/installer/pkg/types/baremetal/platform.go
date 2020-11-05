@@ -6,27 +6,63 @@ import (
 
 // BMC stores the information about a baremetal host's management controller.
 type BMC struct {
-	Username                       string `json:"username"`
-	Password                       string `json:"password"`
-	Address                        string `json:"address"`
+	Username                       string `json:"username" validate:"required"`
+	Password                       string `json:"password" validate:"required"`
+	Address                        string `json:"address" validate:"required,uniqueField"`
 	DisableCertificateVerification bool   `json:"disableCertificateVerification"`
 }
 
+// BootMode puts the server in legacy (BIOS) or UEFI mode for
+// booting. The default is UEFI.
+// +kubebuilder:validation:Enum=UEFI;legacy
+type BootMode string
+
+// Allowed boot mode from metal3
+const (
+	UEFI   BootMode = "UEFI"
+	Legacy BootMode = "legacy"
+)
+
 // Host stores all the configuration data for a baremetal host.
 type Host struct {
-	Name            string `json:"name,omitempty"`
-	BMC             BMC    `json:"bmc"`
-	Role            string `json:"role"`
-	BootMACAddress  string `json:"bootMACAddress"`
-	HardwareProfile string `json:"hardwareProfile"`
+	Name            string           `json:"name,omitempty" validate:"required,uniqueField"`
+	BMC             BMC              `json:"bmc"`
+	Role            string           `json:"role"`
+	BootMACAddress  string           `json:"bootMACAddress" validate:"required,uniqueField"`
+	HardwareProfile string           `json:"hardwareProfile"`
+	RootDeviceHints *RootDeviceHints `json:"rootDeviceHints,omitempty"`
+	BootMode        BootMode         `json:"bootMode,omitempty"`
 }
+
+// ProvisioningNetwork determines how we will use the provisioning network.
+// +kubebuilder:validation:Enum="";Managed;Unmanaged;Disabled
+type ProvisioningNetwork string
+
+const (
+	// ManagedProvisioningNetwork indicates we should fully manage the provisioning network, including DHCP
+	// services required for PXE-based provisioning.
+	ManagedProvisioningNetwork ProvisioningNetwork = "Managed"
+
+	// UnmanagedProvisioningNetwork indicates responsibility for managing the provisioning network is left to the
+	// user. No DHCP server will be configured, however TFTP remains enabled if a user wants to use PXE-based provisioning.
+	// However, they will need to configure external DHCP correctly with next-server definitions set to the relevant
+	// provisioning IP's.
+	UnmanagedProvisioningNetwork ProvisioningNetwork = "Unmanaged"
+
+	// DisabledProvisioningNetwork indicates that no provisioning network will be used. Provisioning capabilities
+	// will be limited to virtual media-based deployments only, and neither DHCP nor TFTP will be operated by the
+	// cluster.
+	DisabledProvisioningNetwork ProvisioningNetwork = "Disabled"
+)
 
 // Platform stores all the global configuration that all machinesets use.
 type Platform struct {
 	// LibvirtURI is the identifier for the libvirtd connection.  It must be
 	// reachable from the host where the installer is run.
-	// +optional
 	// Default is qemu:///system
+	//
+	// +kubebuilder:default="qemu:///system"
+	// +optional
 	LibvirtURI string `json:"libvirtURI,omitempty"`
 
 	// ClusterProvisioningIP is the IP on the dedicated provisioning network
@@ -38,12 +74,19 @@ type Platform struct {
 	// BootstrapProvisioningIP is the IP used on the bootstrap VM to
 	// bring up provisioning services that are used to create the
 	// control-plane machines
+	//
+	// +kubebuilder:validation:Format=ip
 	// +optional
 	BootstrapProvisioningIP string `json:"bootstrapProvisioningIP,omitempty"`
 
 	// External bridge is used for external communication.
 	// +optional
 	ExternalBridge string `json:"externalBridge,omitempty"`
+
+	// ProvisioningNetwork is used to indicate if we will have a provisioning network, and how it will be managed.
+	// +kubebuilder:default=Managed
+	// +optional
+	ProvisioningNetwork ProvisioningNetwork `json:"provisioningNetwork,omitempty"`
 
 	// Provisioning bridge is used for provisioning nodes, on the host that
 	// will run the bootstrap VM.
@@ -58,12 +101,10 @@ type Platform struct {
 	// +optional
 	ProvisioningNetworkCIDR *ipnet.IPNet `json:"provisioningNetworkCIDR,omitempty"`
 
-	// ProvisioningDHCPExternal indicates that DHCP is provided by an external service, appropriately
-	// configured with next-server set to BootstrapProvisioningIP for the control plane, and
-	// ClusterProvisioningIP for workers. The default for this field is false, which means we will
-	// start and manage a DHCP server on the provisioning network.
+	// DeprecatedProvisioningDHCPExternal indicates that DHCP is provided by an external service. This parameter is
+	// replaced by ProvisioningNetwork being set to "Unmanaged".
 	// +optional
-	ProvisioningDHCPExternal bool `json:"provisioningDHCPExternal,omitempty"`
+	DeprecatedProvisioningDHCPExternal bool `json:"provisioningDHCPExternal,omitempty"`
 
 	// ProvisioningDHCPRange is used to provide DHCP services to hosts
 	// for provisioning.
@@ -80,23 +121,26 @@ type Platform struct {
 	DefaultMachinePlatform *MachinePool `json:"defaultMachinePlatform,omitempty"`
 
 	// APIVIP is the VIP to use for internal API communication
+	//
+	// +kubebuilder:validation:Format=ip
 	APIVIP string `json:"apiVIP"`
 
 	// IngressVIP is the VIP to use for ingress traffic
+	//
+	// +kubebuilder:validation:Format=ip
 	IngressVIP string `json:"ingressVIP"`
-
-	// DNSVIP is the VIP to use for internal DNS communication
-	DNSVIP string `json:"dnsVIP"`
 
 	// BootstrapOSImage is a URL to override the default OS image
 	// for the bootstrap node. The URL must contain a sha256 hash of the image
 	// e.g https://mirror.example.com/images/qemu.qcow2.gz?sha256=a07bd...
+	//
 	// +optional
-	BootstrapOSImage string `json:"bootstrapOSImage,omitempty"`
+	BootstrapOSImage string `json:"bootstrapOSImage,omitempty" validate:"omitempty,osimageuri,urlexist"`
 
 	// ClusterOSImage is a URL to override the default OS image
 	// for cluster nodes. The URL must contain a sha256 hash of the image
 	// e.g https://mirror.example.com/images/metal.qcow2.gz?sha256=3b5a8...
+	//
 	// +optional
-	ClusterOSImage string `json:"clusterOSImage,omitempty"`
+	ClusterOSImage string `json:"clusterOSImage,omitempty" validate:"omitempty,osimageuri,urlexist"`
 }

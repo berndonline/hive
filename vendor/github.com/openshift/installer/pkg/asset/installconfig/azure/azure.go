@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/Azure/go-autorest/autorest/to"
 
@@ -13,9 +12,6 @@ import (
 
 	"github.com/pkg/errors"
 	survey "gopkg.in/AlecAivazis/survey.v1"
-
-	azres "github.com/Azure/azure-sdk-for-go/profiles/latest/resources/mgmt/resources"
-	azsub "github.com/Azure/azure-sdk-for-go/profiles/latest/resources/mgmt/subscriptions"
 )
 
 const (
@@ -24,12 +20,21 @@ const (
 
 // Platform collects azure-specific configuration.
 func Platform() (*azure.Platform, error) {
-	regions, err := getRegions()
+	// Create client using public cloud because install config has not been generated yet.
+	const cloudName = azure.PublicCloud
+	ssn, err := GetSession(cloudName)
+	if err != nil {
+		return nil, err
+	}
+
+	client := NewClient(ssn)
+
+	regions, err := getRegions(context.TODO(), client)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get list of regions")
 	}
 
-	resourceCapableRegions, err := getResourceCapableRegions()
+	resourceCapableRegions, err := getResourceCapableRegions(context.TODO(), client)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get list of resources to check available regions")
 	}
@@ -83,44 +88,26 @@ func Platform() (*azure.Platform, error) {
 	}
 
 	return &azure.Platform{
-		Region: region,
+		Region:    region,
+		CloudName: cloudName,
 	}, nil
 }
 
-func getRegions() (map[string]string, error) {
-	session, err := GetSession()
-	if err != nil {
-		return nil, err
-	}
-	client := azsub.NewClient()
-	client.Authorizer = session.Authorizer
-	ctx, cancel := context.WithTimeout(context.TODO(), 30*time.Second)
-	defer cancel()
-	locations, err := client.ListLocations(ctx, session.Credentials.SubscriptionID)
+func getRegions(ctx context.Context, client API) (map[string]string, error) {
+	locations, err := client.ListLocations(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	locationsValue := *locations.Value
 	allLocations := map[string]string{}
-	for _, location := range locationsValue {
+	for _, location := range *locations {
 		allLocations[to.String(location.Name)] = to.String(location.DisplayName)
 	}
 	return allLocations, nil
 }
 
-func getResourceCapableRegions() ([]string, error) {
-	session, err := GetSession()
-	if err != nil {
-		return nil, err
-	}
-
-	client := azres.NewProvidersClient(session.Credentials.SubscriptionID)
-	client.Authorizer = session.Authorizer
-	ctx, cancel := context.WithTimeout(context.TODO(), 30*time.Second)
-	defer cancel()
-
-	provider, err := client.Get(ctx, "Microsoft.Resources", "")
+func getResourceCapableRegions(ctx context.Context, client API) ([]string, error) {
+	provider, err := client.GetResourcesProvider(ctx, "Microsoft.Resources")
 	if err != nil {
 		return nil, err
 	}

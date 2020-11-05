@@ -11,13 +11,15 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	k8slabels "github.com/openshift/hive/pkg/util/labels"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
-	k8slabels "k8s.io/kubernetes/pkg/util/labels"
+	"k8s.io/client-go/util/flowcontrol"
+	"k8s.io/client-go/util/workqueue"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -32,12 +34,12 @@ import (
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
 	"github.com/openshift/hive/pkg/constants"
 	hivemetrics "github.com/openshift/hive/pkg/controller/metrics"
-	"github.com/openshift/hive/pkg/controller/utils"
+	controllerutils "github.com/openshift/hive/pkg/controller/utils"
 	"github.com/openshift/hive/pkg/resource"
 )
 
 const (
-	controllerName = "remoteingress"
+	ControllerName = hivev1.RemoteIngressControllerName
 
 	// namespace where the ingressController objects must be created
 	remoteIngressControllerNamespace = "openshift-ingress-operator"
@@ -62,25 +64,35 @@ type kubeCLIApplier interface {
 // Add creates a new RemoteMachineSet Controller and adds it to the Manager with default RBAC. The Manager will set fields on the
 // Controller and Start it when the Manager is Started.
 func Add(mgr manager.Manager) error {
-	return AddToManager(mgr, NewReconciler(mgr))
+	logger := log.WithField("controller", ControllerName)
+	concurrentReconciles, clientRateLimiter, queueRateLimiter, err := controllerutils.GetControllerConfig(mgr.GetClient(), ControllerName)
+	if err != nil {
+		logger.WithError(err).Error("could not get controller configurations")
+		return err
+	}
+	return AddToManager(mgr, NewReconciler(mgr, clientRateLimiter), concurrentReconciles, queueRateLimiter)
 }
 
 // NewReconciler returns a new reconcile.Reconciler
-func NewReconciler(mgr manager.Manager) reconcile.Reconciler {
-	logger := log.WithField("controller", controllerName)
-	helper := resource.NewHelperWithMetricsFromRESTConfig(mgr.GetConfig(), controllerName, logger)
+func NewReconciler(mgr manager.Manager, rateLimiter flowcontrol.RateLimiter) reconcile.Reconciler {
+	logger := log.WithField("controller", ControllerName)
+	helper := resource.NewHelperWithMetricsFromRESTConfig(mgr.GetConfig(), ControllerName, logger)
 	return &ReconcileRemoteClusterIngress{
-		Client:  utils.NewClientWithMetricsOrDie(mgr, controllerName),
+		Client:  controllerutils.NewClientWithMetricsOrDie(mgr, ControllerName, &rateLimiter),
 		scheme:  mgr.GetScheme(),
-		logger:  log.WithField("controller", controllerName),
+		logger:  log.WithField("controller", ControllerName),
 		kubeCLI: helper,
 	}
 }
 
 // AddToManager adds a new Controller to mgr with r as the reconcile.Reconciler
-func AddToManager(mgr manager.Manager, r reconcile.Reconciler) error {
+func AddToManager(mgr manager.Manager, r reconcile.Reconciler, concurrentReconciles int, rateLimiter workqueue.RateLimiter) error {
 	// Create a new controller
-	c, err := controller.New("remoteingress-controller", mgr, controller.Options{Reconciler: r, MaxConcurrentReconciles: utils.GetConcurrentReconciles()})
+	c, err := controller.New("remoteingress-controller", mgr, controller.Options{
+		Reconciler:              r,
+		MaxConcurrentReconciles: concurrentReconciles,
+		RateLimiter:             rateLimiter,
+	})
 	if err != nil {
 		return err
 	}
@@ -115,17 +127,10 @@ type ReconcileRemoteClusterIngress struct {
 // any needed ClusterIngress objects up for syncing to the remote cluster.
 //
 func (r *ReconcileRemoteClusterIngress) Reconcile(request reconcile.Request) (reconcile.Result, error) {
-	start := time.Now()
-	cdLog := r.logger.WithFields(log.Fields{
-		"clusterDeployment": request.Name,
-		"namespace":         request.Namespace,
-	})
+	cdLog := controllerutils.BuildControllerLogger(ControllerName, "clusterDeployment", request.NamespacedName)
 	cdLog.Info("reconciling cluster deployment")
-	defer func() {
-		dur := time.Since(start)
-		hivemetrics.MetricControllerReconcileTime.WithLabelValues(controllerName).Observe(dur.Seconds())
-		cdLog.WithField("elapsed", dur).Info("reconcile complete")
-	}()
+	recobsrv := hivemetrics.NewReconcileObserver(ControllerName, cdLog)
+	defer recobsrv.ObserveControllerReconcileTime()
 
 	rContext := &reconcileContext{}
 
@@ -142,6 +147,13 @@ func (r *ReconcileRemoteClusterIngress) Reconcile(request reconcile.Request) (re
 		return reconcile.Result{}, err
 	}
 	rContext.clusterDeployment = cd
+
+	// Ensure owner references are correctly set
+	err = controllerutils.ReconcileOwnerReferences(cd, generateOwnershipUniqueKeys(cd), r, r.scheme, cdLog)
+	if err != nil {
+		cdLog.WithError(err).Error("Error reconciling object ownership")
+		return reconcile.Result{}, err
+	}
 
 	// If the clusterdeployment is deleted, do not reconcile.
 	if cd.DeletionTimestamp != nil {
@@ -245,7 +257,7 @@ func newSyncSetSpec(cd *hivev1.ClusterDeployment, rawExtensions []runtime.RawExt
 		SyncSetCommonSpec: hivev1.SyncSetCommonSpec{
 			Resources:         rawExtensions,
 			Secrets:           secretMappings,
-			ResourceApplyMode: "sync",
+			ResourceApplyMode: hivev1.SyncResourceApplyMode,
 		},
 		ClusterDeploymentRefs: []corev1.LocalObjectReference{
 			{
@@ -373,7 +385,7 @@ func (r *ReconcileRemoteClusterIngress) setIngressCertificateNotFoundCondition(r
 	var (
 		msg, reason string
 		status      corev1.ConditionStatus
-		updateCheck utils.UpdateConditionCheck
+		updateCheck controllerutils.UpdateConditionCheck
 	)
 
 	origCD := rContext.clusterDeployment.DeepCopy()
@@ -382,20 +394,20 @@ func (r *ReconcileRemoteClusterIngress) setIngressCertificateNotFoundCondition(r
 		msg = missingSecretMessage
 		status = corev1.ConditionTrue
 		reason = ingressCertificateNotFoundReason
-		updateCheck = utils.UpdateConditionIfReasonOrMessageChange
+		updateCheck = controllerutils.UpdateConditionIfReasonOrMessageChange
 	} else {
 		msg = fmt.Sprintf("all secrets for ingress found")
 		status = corev1.ConditionFalse
 		reason = ingressCertificateFoundReason
-		updateCheck = utils.UpdateConditionNever
+		updateCheck = controllerutils.UpdateConditionNever
 	}
 
-	rContext.clusterDeployment.Status.Conditions = utils.SetClusterDeploymentCondition(rContext.clusterDeployment.Status.Conditions,
+	rContext.clusterDeployment.Status.Conditions = controllerutils.SetClusterDeploymentCondition(rContext.clusterDeployment.Status.Conditions,
 		hivev1.IngressCertificateNotFoundCondition, status, reason, msg, updateCheck)
 
 	if !reflect.DeepEqual(rContext.clusterDeployment.Status.Conditions, origCD.Status.Conditions) {
 		if err := r.Status().Update(context.TODO(), rContext.clusterDeployment); err != nil {
-			rContext.logger.WithError(err).Log(utils.LogLevel(err), "error updating clusterDeployment condition")
+			rContext.logger.WithError(err).Log(controllerutils.LogLevel(err), "error updating clusterDeployment condition")
 			return err
 		}
 	}
@@ -428,4 +440,17 @@ func secretHash(secret *corev1.Secret) string {
 		b.Write([]byte("\n"))
 	}
 	return fmt.Sprintf("%x", md5.Sum(b.Bytes()))
+}
+
+func generateOwnershipUniqueKeys(owner hivev1.MetaRuntimeObject) []*controllerutils.OwnershipUniqueKey {
+	return []*controllerutils.OwnershipUniqueKey{
+		{
+			TypeToList: &hivev1.SyncSetList{},
+			LabelSelector: map[string]string{
+				constants.ClusterDeploymentNameLabel: owner.GetName(),
+				constants.SyncSetTypeLabel:           constants.SyncSetTypeRemoteIngress,
+			},
+			Controlled: true,
+		},
+	}
 }

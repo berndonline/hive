@@ -29,6 +29,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/util/flowcontrol"
+	"k8s.io/client-go/util/workqueue"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -44,35 +46,44 @@ import (
 )
 
 const (
-	controllerName = "unreachable"
+	ControllerName = hivev1.UnreachableControllerName
 
-	maxUnreachableDuration      = 2 * time.Hour
-	noOfAttemptsWhenUnreachable = 4
+	maxUnreachableDuration = 2 * time.Hour
 )
 
 // Add creates a new Unreachable Controller and adds it to the Manager with default RBAC. The Manager will set fields on the
 // Controller and Start it when the Manager is Started.
 func Add(mgr manager.Manager) error {
-	return AddToManager(mgr, NewReconciler(mgr))
+	logger := log.WithField("controller", ControllerName)
+	concurrentReconciles, clientRateLimiter, queueRateLimiter, err := controllerutils.GetControllerConfig(mgr.GetClient(), ControllerName)
+	if err != nil {
+		logger.WithError(err).Error("could not get controller configurations")
+		return err
+	}
+	return AddToManager(mgr, NewReconciler(mgr, clientRateLimiter), concurrentReconciles, queueRateLimiter)
 }
 
 // NewReconciler returns a new reconcile.Reconciler
-func NewReconciler(mgr manager.Manager) reconcile.Reconciler {
+func NewReconciler(mgr manager.Manager, rateLimiter flowcontrol.RateLimiter) reconcile.Reconciler {
 	r := &ReconcileRemoteMachineSet{
-		Client: controllerutils.NewClientWithMetricsOrDie(mgr, controllerName),
+		Client: controllerutils.NewClientWithMetricsOrDie(mgr, ControllerName, &rateLimiter),
 		scheme: mgr.GetScheme(),
-		logger: log.WithField("controller", controllerName),
+		logger: log.WithField("controller", ControllerName),
 	}
 	r.remoteClusterAPIClientBuilder = func(cd *hivev1.ClusterDeployment) remoteclient.Builder {
-		return remoteclient.NewBuilder(r.Client, cd, controllerName)
+		return remoteclient.NewBuilder(r.Client, cd, ControllerName)
 	}
 	return r
 }
 
 // AddToManager adds a new Controller to mgr with r as the reconcile.Reconciler
-func AddToManager(mgr manager.Manager, r reconcile.Reconciler) error {
+func AddToManager(mgr manager.Manager, r reconcile.Reconciler, concurrentReconciles int, rateLimiter workqueue.RateLimiter) error {
 	// Create a new controller
-	c, err := controller.New("unreachable-controller", mgr, controller.Options{Reconciler: r, MaxConcurrentReconciles: controllerutils.GetConcurrentReconciles()})
+	c, err := controller.New("unreachable-controller", mgr, controller.Options{
+		Reconciler:              r,
+		MaxConcurrentReconciles: concurrentReconciles,
+		RateLimiter:             rateLimiter,
+	})
 	if err != nil {
 		return err
 	}
@@ -102,20 +113,10 @@ type ReconcileRemoteMachineSet struct {
 
 // Reconcile checks if we can establish an API client connection to the remote cluster and maintains the unreachable condition as a result.
 func (r *ReconcileRemoteMachineSet) Reconcile(request reconcile.Request) (reconcile.Result, error) {
-	start := time.Now()
-	cdLog := log.WithFields(log.Fields{
-		"clusterDeployment": request.Name,
-		"namespace":         request.Namespace,
-		"controller":        controllerName,
-	})
-
-	// For logging, we need to see when the reconciliation loop starts and ends.
+	cdLog := controllerutils.BuildControllerLogger(ControllerName, "clusterDeployment", request.NamespacedName)
 	cdLog.Info("reconciling cluster deployment")
-	defer func() {
-		dur := time.Since(start)
-		hivemetrics.MetricControllerReconcileTime.WithLabelValues(controllerName).Observe(dur.Seconds())
-		cdLog.WithField("elapsed", dur).Info("reconcile complete")
-	}()
+	recobsrv := hivemetrics.NewReconcileObserver(ControllerName, cdLog)
+	defer recobsrv.ObserveControllerReconcileTime()
 
 	cd := &hivev1.ClusterDeployment{}
 	err := r.Get(context.TODO(), request.NamespacedName, cd)
@@ -145,54 +146,86 @@ func (r *ReconcileRemoteMachineSet) Reconcile(request reconcile.Request) (reconc
 		return reconcile.Result{}, nil
 	}
 
-	// Check if we're due for rechecking cluster's connectivity
-	cond := controllerutils.FindClusterDeploymentCondition(cd.Status.Conditions, hivev1.UnreachableCondition)
-	if cond != nil {
-		if !isTimeForConnectivityCheck(cond) {
-			cdLog.WithFields(log.Fields{
-				"sinceLastTransition": time.Since(cond.LastTransitionTime.Time),
-				"sinceLastProbe":      time.Since(cond.LastProbeTime.Time),
-			}).Debug("skipping unreachable check")
-			return reconcile.Result{}, nil
-		}
+	// Check whether, prior to this reconciliation, the remote cluster was considered unreachable. Also, get the
+	// last time that the unreachable check was performed.
+	wasUnreachable, lastCheck := remoteclient.Unreachable(cd)
+	// Check whether, prior to this reconciliation, connectivity to the remote cluster was using the preferred API URL.
+	wasPrimaryActive := remoteclient.IsPrimaryURLActive(cd)
+	// Determine the amount of time to wait before rechecking connectivity to a reachable remote cluster.
+	connectivityRecheckDelay := maxUnreachableDuration - time.Since(lastCheck)
+	// Determine if it is time to recheck connectivity.
+	connectivityRecheckNeeded := wasUnreachable || connectivityRecheckDelay <= 0*time.Second
+
+	// If the remote cluster was reachable via the preferred API URL and it is not time to recheck connectivity,
+	// then requeue the ClusterDeployment to be synced again when it is time for the next connectivity check.
+	// If connectivity was not being made via the preferred API URL, the reconciliation needs to proceed in order to
+	// check connectivity to the preferred API URL.
+	if !connectivityRecheckNeeded && wasPrimaryActive {
+		cdLog.WithField("delay", connectivityRecheckDelay).Debug("waiting to check connectivity")
+		return reconcile.Result{RequeueAfter: connectivityRecheckDelay}, nil
 	}
 
 	cdLog.Info("checking if cluster is reachable")
 	remoteClientBuilder := r.remoteClusterAPIClientBuilder(cd)
-	hasOverride := cd.Spec.ControlPlaneConfig.APIURLOverride != ""
-	var (
-		unreachableError          error
-		activeAPIURLOverrideError error
-	)
-	if _, primaryErr := remoteClientBuilder.UsePrimaryAPIURL().Build(); primaryErr != nil {
-		if hasOverride {
+	var unreachableError error
+	updateUnreachable := true
+	// Attempt to connect to the remote cluster using the preferred API URL.
+	_, primaryErr := remoteClientBuilder.UsePrimaryAPIURL().Build()
+	if primaryErr != nil {
+		// If the remote cluster is not accessible via the preferred API URL, check if there is a fallback API URL to use.
+		if hasOverride(cd) {
 			cdLog.WithError(primaryErr).Info("unable to create remote API client using API URL override")
-			activeAPIURLOverrideError = primaryErr
-			if _, secondaryErr := remoteClientBuilder.UseSecondaryAPIURL().Build(); secondaryErr != nil {
-				cdLog.WithError(secondaryErr).Warn("unable to create remote API client with either the initial API URL or the API URL override, marking cluster unreachable")
-				unreachableError = utilerrors.NewAggregate([]error{primaryErr, secondaryErr})
+			// If a connectivity recheck is needed or the remote cluster was reachable via the preferred API URL prior
+			// to this reconciliation, then attempt to connect to the remote cluster using the fallback API URL.
+			// Even when the controller continues to reconcile a ClusterDeployment waiting for the preferred API URL to
+			// become accessible, the controller should not recheck connectivity via the fallback API URL more often
+			// than once every 2 hours.
+			if connectivityRecheckNeeded || wasPrimaryActive {
+				if _, secondaryErr := remoteClientBuilder.UseSecondaryAPIURL().Build(); secondaryErr != nil {
+					cdLog.WithError(secondaryErr).Warn("unable to create remote API client with either the initial API URL or the API URL override, marking cluster unreachable")
+					unreachableError = utilerrors.NewAggregate([]error{primaryErr, secondaryErr})
+				}
+			} else {
+				updateUnreachable = false
 			}
 		} else {
 			cdLog.WithError(primaryErr).Warn("unable to create remote API client, marking cluster unreachable")
 			unreachableError = primaryErr
 		}
 	}
-	unreachableChanged := setUnreachableCond(cd, unreachableError)
-	activeAPIURLOverrideChanged := setActiveAPIURLOverrideCond(cd, hasOverride, activeAPIURLOverrideError)
 
-	if !unreachableChanged && !activeAPIURLOverrideChanged {
-		return reconcile.Result{}, nil
+	// Update conditions to reflect the current state of connectivity to the remote cluster.
+	unreachableChanged := false
+	if updateUnreachable {
+		unreachableChanged = setUnreachableCond(cd, unreachableError)
+	}
+	overrideChanged := setActiveAPIURLOverrideCond(cd, primaryErr)
+
+	// Determine when to requeue the ClusterDeployment. If there is no connectivity to the remote cluster via the
+	// preferred API URL, then requeue the ClusterDeployment using the backoff. If there is connectivity via the
+	// preferred API URL, then requeue the ClusterDeployment to sync again in 2 hours for the next connectivity re-check.
+	result := reconcile.Result{Requeue: primaryErr != nil}
+	if !result.Requeue {
+		result.RequeueAfter = maxUnreachableDuration
 	}
 
-	if hasOverride {
-		if activeAPIURLOverrideError == nil {
-			cdLog.Info("cluster is reachable via API URL override")
-		} else if unreachableError == nil {
-			cdLog.Info("cluster is reachable via initial API URL")
-		}
-	} else {
-		if unreachableError == nil {
+	// If none of the conditions have changed, stop the reconciliation now without updating the ClusterDeployment.
+	if !unreachableChanged && !overrideChanged {
+		return result, nil
+	}
+
+	// Log an info entry when the remote cluster becomes reachable.
+	transitionedToReachable := wasUnreachable && unreachableError == nil
+	isPrimaryActive := primaryErr == nil
+	transitionedToPrimaryActive := !wasPrimaryActive && isPrimaryActive
+	if transitionedToReachable || transitionedToPrimaryActive {
+		switch {
+		case !hasOverride(cd):
 			cdLog.Info("cluster is reachable")
+		case isPrimaryActive:
+			cdLog.Info("cluster is reachable via API URL override")
+		default:
+			cdLog.Info("cluster is reachable via initial API URL")
 		}
 	}
 
@@ -200,33 +233,21 @@ func (r *ReconcileRemoteMachineSet) Reconcile(request reconcile.Request) (reconc
 	if err != nil {
 		cdLog.WithError(err).Log(controllerutils.LogLevel(err), "error updating cluster deployment with unreachable condition")
 	}
-	return reconcile.Result{}, err
+	return result, err
 }
 
 func setUnreachableCond(cd *hivev1.ClusterDeployment, connectionError error) (condsChanged bool) {
-	status := corev1.ConditionFalse
-	reason := "ClusterReachable"
-	message := "cluster is reachable"
-	updateCheck := controllerutils.UpdateConditionNever
-	if connectionError != nil {
-		status = corev1.ConditionTrue
-		reason = "ErrorConnectingToCluster"
-		message = connectionError.Error()
-		updateCheck = controllerutils.UpdateConditionIfReasonOrMessageChange
+	if existingCond := controllerutils.FindClusterDeploymentCondition(cd.Status.Conditions, hivev1.UnreachableCondition); existingCond == nil {
+		// This adds a dummy Unreachable condition that will be updated when setting the condition later.
+		// The Unreachable condition needs to be present even when the cluster is reachable because the probe time
+		// on the condition determines when the controller should next check for connectivity.
+		cd.Status.Conditions = append(cd.Status.Conditions, hivev1.ClusterDeploymentCondition{Type: hivev1.UnreachableCondition})
 	}
-	cd.Status.Conditions, condsChanged = controllerutils.SetClusterDeploymentConditionWithChangeCheck(
-		cd.Status.Conditions,
-		hivev1.UnreachableCondition,
-		status,
-		reason,
-		message,
-		updateCheck,
-	)
-	return
+	return remoteclient.SetUnreachableCondition(cd, connectionError)
 }
 
-func setActiveAPIURLOverrideCond(cd *hivev1.ClusterDeployment, hasOverride bool, connectionError error) (condsChanged bool) {
-	if !hasOverride {
+func setActiveAPIURLOverrideCond(cd *hivev1.ClusterDeployment, connectionError error) (condsChanged bool) {
+	if !hasOverride(cd) {
 		return
 	}
 	if existingCond := controllerutils.FindClusterDeploymentCondition(cd.Status.Conditions, hivev1.ActiveAPIURLOverrideCondition); existingCond == nil {
@@ -256,13 +277,6 @@ func setActiveAPIURLOverrideCond(cd *hivev1.ClusterDeployment, hasOverride bool,
 	return
 }
 
-// isTimeForConnectivityCheck returns true as per the condition to check if cluster is reachable/unreachable
-// else it returns false
-func isTimeForConnectivityCheck(condition *hivev1.ClusterDeploymentCondition) bool {
-	sinceLastTransition := time.Since(condition.LastTransitionTime.Time)
-	sinceLastProbe := time.Since(condition.LastProbeTime.Time)
-	if sinceLastProbe < (sinceLastTransition/noOfAttemptsWhenUnreachable) && sinceLastProbe < maxUnreachableDuration {
-		return false
-	}
-	return true
+func hasOverride(cd *hivev1.ClusterDeployment) bool {
+	return cd.Spec.ControlPlaneConfig.APIURLOverride != ""
 }

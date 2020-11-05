@@ -23,8 +23,8 @@ git clone \
 REMOVED_VERSIONS=""
 if [[ "$REMOVE_UNDEPLOYED" == true ]]; then
     DEPLOYED_HASH=$(
-        curl -s 'https://gitlab.cee.redhat.com/service/saas-hive/raw/master/hive-services/hive.yaml' | \
-            docker run --rm -i evns/yq -r '.services[]|select(.name="hive").hash'
+        curl -s https://gitlab.cee.redhat.com/service/app-interface/-/raw/master/data/services/hive/cicd/ci-int/saas-hive.yaml | \
+            docker run --rm -i quay.io/openshift-hive/yq:latest -r '.resourceTemplates[]|select(.name="hive").targets[]|select(.namespace."$ref"=="/services/hive/namespaces/hive-production.yml").ref'
     )
 
     delete=false
@@ -91,7 +91,7 @@ REGISTRY_IMG="quay.io/app-sre/hive-registry"
 DOCKERFILE_REGISTRY="Dockerfile.olm-registry"
 
 cat <<EOF > $DOCKERFILE_REGISTRY
-FROM quay.io/openshift/origin-operator-registry:latest
+FROM quay.io/openshift/origin-operator-registry:4.5
 
 COPY $SAAS_OPERATOR_DIR manifests
 RUN initializer

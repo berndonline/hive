@@ -9,13 +9,13 @@ import (
 
 	"github.com/openshift/hive/contrib/pkg/adm"
 	"github.com/openshift/hive/contrib/pkg/certificate"
+	"github.com/openshift/hive/contrib/pkg/clusterpool"
 	"github.com/openshift/hive/contrib/pkg/createcluster"
 	"github.com/openshift/hive/contrib/pkg/deprovision"
-	"github.com/openshift/hive/contrib/pkg/labelobjects"
 	"github.com/openshift/hive/contrib/pkg/report"
 	"github.com/openshift/hive/contrib/pkg/testresource"
-	"github.com/openshift/hive/contrib/pkg/v1migration"
 	"github.com/openshift/hive/contrib/pkg/verification"
+	"github.com/openshift/hive/contrib/pkg/version"
 	"github.com/openshift/hive/pkg/imageset"
 	"github.com/openshift/hive/pkg/installmanager"
 )
@@ -50,10 +50,10 @@ func newHiveutilCommand() *cobra.Command {
 	cmd.AddCommand(testresource.NewTestResourceCommand())
 	cmd.AddCommand(createcluster.NewCreateClusterCommand())
 	cmd.AddCommand(report.NewClusterReportCommand())
-	cmd.AddCommand(v1migration.NewV1MigrationCommand())
 	cmd.AddCommand(certificate.NewCertificateCommand())
 	cmd.AddCommand(adm.NewAdmCommand())
-	cmd.AddCommand(labelobjects.NewLabelObjectsCommand())
+	cmd.AddCommand(version.NewVersionCommand())
+	cmd.AddCommand(clusterpool.NewClusterPoolCommand())
 
 	return cmd
 }

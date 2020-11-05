@@ -3,13 +3,13 @@ package installmanager
 import (
 	"context"
 	"fmt"
-	"github.com/stretchr/testify/require"
 	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
@@ -149,11 +149,12 @@ func TestInstallManager(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			tempDir, err := ioutil.TempDir("", "installmanagertest")
-			if !assert.NoError(t, err) {
-				t.Fail()
-			}
+			require.NoError(t, err)
 			defer os.RemoveAll(tempDir)
 			defer os.Remove(installerConsoleLogFilePath)
+
+			binaryTempDir, err := ioutil.TempDir(tempDir, "bin")
+			require.NoError(t, err)
 
 			pullSecret := testSecret(corev1.SecretTypeDockerConfigJson, pullSecretSecretName, corev1.DockerConfigJsonKey, "{}")
 			existing := test.existing
@@ -181,6 +182,7 @@ func TestInstallManager(t *testing.T) {
 				DynamicClient:          fakeClient,
 				InstallConfigMountPath: mountedInstallConfigFile,
 				PullSecretMountPath:    mountedPullSecretFile,
+				binaryDir:              binaryTempDir,
 			}
 			im.Complete([]string{})
 
@@ -379,10 +381,9 @@ func testSecret(secretType corev1.SecretType, name, key, value string) *corev1.S
 
 func TestCleanupRegex(t *testing.T) {
 	tests := []struct {
-		name            string
-		sourceString    string
-		missingStrings  []string
-		expectedStrings []string
+		name           string
+		sourceString   string
+		expectedString string
 	}{
 		{
 			name: "install log example",
@@ -400,119 +401,66 @@ level=info msg="Install complete!"
 level=info msg="To access the cluster as the system:admin user when using 'oc', run 'export KUBECONFIG=/output/auth/kubeconfig'"
 level=info msg="Access the OpenShift web-console here: https://console-openshift-console.apps.test-cluster.example.com"
 level=info msg="Login to the console with user: kubeadmin, password: SomeS-ecret-Passw-ord12-34567"`,
-			missingStrings: []string{
-				"password",
-				"SomeS-ecret-Passw-ord12-34567",
-			},
+			expectedString: `level=info msg="Consuming \"Worker Ignition Config\" from target directory"
+level=info msg="Consuming \"Bootstrap Ignition Config\" from target directory"
+level=info msg="Consuming \"Master Ignition Config\" from target directory"
+level=info msg="Creating infrastructure resources..."
+level=info msg="Waiting up to 30m0s for the Kubernetes API at https://api.test-cluster.example.com:6443..."
+level=info msg="API v1.13.4+af45cda up"
+level=info msg="Waiting up to 30m0s for the bootstrap-complete event..."
+level=info msg="Destroying the bootstrap resources..."
+level=info msg="Waiting up to 30m0s for the cluster at https://api.test-cluster.example.com:6443 to initialize..."
+level=info msg="Waiting up to 10m0s for the openshift-console route to be created..."
+level=info msg="Install complete!"
+level=info msg="To access the cluster as the system:admin user when using 'oc', run 'export KUBECONFIG=/output/auth/kubeconfig'"
+level=info msg="Access the OpenShift web-console here: https://console-openshift-console.apps.test-cluster.example.com"
+REDACTED LINE OF OUTPUT`,
 		},
 		{
 			name: "password at start of line",
 			sourceString: `some log line
 password at start of line
 more log`,
-			missingStrings: []string{"password"},
+			expectedString: `some log line
+REDACTED LINE OF OUTPUT
+more log`,
 		},
 		{
 			name: "password in first line",
 			sourceString: `first line password more text
 second line no magic string`,
-			missingStrings: []string{"password"},
+			expectedString: `REDACTED LINE OF OUTPUT
+second line no magic string`,
 		},
 		{
 			name: "password in last line",
 			sourceString: `first line
 last line with password in text`,
-			missingStrings: []string{"password"},
+			expectedString: `first line
+REDACTED LINE OF OUTPUT`,
 		},
 		{
 			name:           "case sensitivity test",
 			sourceString:   `abc PaSsWoRd def`,
-			missingStrings: []string{"PaSsWoRd"},
+			expectedString: `REDACTED LINE OF OUTPUT`,
 		},
 		{
 			name:         "libvirt ssh connection error in console log",
 			sourceString: "Internal error: could not connect to libvirt: virError(Code=38, Domain=7, Message='Cannot recv data: Permission denied, please try again.\\r\\nPermission denied (publickey,gssapi-keyex,gssapi-with-mic,password)",
-			missingStrings: []string{
-				"Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password)",
-			},
-			expectedStrings: []string{
-				"Internal error: could not connect to libvirt: virError(Code=38, Domain=7",
-				"Permission denied, please try again.",
-			},
-		},
-	}
-
-	for _, test := range tests {
-		cleanedString := cleanupLogOutput(test.sourceString)
-
-		for _, testString := range test.missingStrings {
-			assert.False(t, strings.Contains(cleanedString, testString),
-				"testing %v: unexpected string found after cleaning",
-				test.name, testString)
-		}
-
-		for _, testString := range test.expectedStrings {
-			assert.True(t, strings.Contains(cleanedString, testString),
-				"testing %v: expected string %q not found after cleaning: %q became %q",
-				test.name, testString, test.sourceString, cleanedString)
-		}
-	}
-
-}
-
-func TestGatherLogs(t *testing.T) {
-	fakeBootstrapIP := "1.2.3.4"
-
-	tests := []struct {
-		name            string
-		scriptTemplate  string
-		expectedLogData string
-		expectedError   bool
-	}{
-		{
-			name:           "cannot execute script",
-			scriptTemplate: "not a bash script %s %s %s",
-			expectedError:  true,
-		},
-		{
-			name: "successfully run script file",
-			scriptTemplate: `#!/bin/bash
-		echo "fake log output %s %s" > %s`,
-			expectedLogData: fmt.Sprintf("fake log output %s %s\n", fakeBootstrapIP, fakeBootstrapIP),
-		},
-		{
-			name: "error running script",
-			scriptTemplate: `#!/bin/bash
-exit 2`,
-			expectedError: true,
+			// In addition to redacting the line with "password" the
+			// escaped carriage returns and newlines are unescaped.
+			expectedString: "Internal error: could not connect to libvirt: virError(Code=38, Domain=7, Message='Cannot recv data: Permission denied, please try again.\r\nREDACTED LINE OF OUTPUT",
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			im := InstallManager{
-				LogLevel: "debug",
-				isGatherLogsEnabled: func() bool {
-					return true
-				},
-			}
-			assert.NoError(t, im.Complete([]string{}))
-			result, err := im.runGatherScript(fakeBootstrapIP, test.scriptTemplate, "/tmp")
-			if test.expectedError {
-				assert.Error(t, err, "expected error for test case %s", test.name)
-			} else {
-				t.Logf("result file: %s", result)
-				data, err := ioutil.ReadFile(result)
-				assert.NoError(t, err, "error reading returned log file data")
-				assert.Equal(t, test.expectedLogData, string(data))
-
-				// cleanup saved/copied logfile
-				if err := os.RemoveAll(result); err != nil {
-					t.Logf("couldn't delete saved log file: %v", err)
-				}
-			}
+			cleanedString := cleanupLogOutput(test.sourceString)
+			assert.Equal(t, test.expectedString, cleanedString,
+				"unexpected cleaned string")
 		})
 	}
+
 }
 
 func TestInstallManagerSSH(t *testing.T) {

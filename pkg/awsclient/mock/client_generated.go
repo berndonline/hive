@@ -12,6 +12,7 @@ import (
 	route53 "github.com/aws/aws-sdk-go/service/route53"
 	s3 "github.com/aws/aws-sdk-go/service/s3"
 	s3iface "github.com/aws/aws-sdk-go/service/s3/s3iface"
+	sts "github.com/aws/aws-sdk-go/service/sts"
 	gomock "github.com/golang/mock/gomock"
 	reflect "reflect"
 )
@@ -157,6 +158,36 @@ func (m *MockClient) TerminateInstances(arg0 *ec2.TerminateInstancesInput) (*ec2
 func (mr *MockClientMockRecorder) TerminateInstances(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "TerminateInstances", reflect.TypeOf((*MockClient)(nil).TerminateInstances), arg0)
+}
+
+// StopInstances mocks base method
+func (m *MockClient) StopInstances(arg0 *ec2.StopInstancesInput) (*ec2.StopInstancesOutput, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "StopInstances", arg0)
+	ret0, _ := ret[0].(*ec2.StopInstancesOutput)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// StopInstances indicates an expected call of StopInstances
+func (mr *MockClientMockRecorder) StopInstances(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StopInstances", reflect.TypeOf((*MockClient)(nil).StopInstances), arg0)
+}
+
+// StartInstances mocks base method
+func (m *MockClient) StartInstances(arg0 *ec2.StartInstancesInput) (*ec2.StartInstancesOutput, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "StartInstances", arg0)
+	ret0, _ := ret[0].(*ec2.StartInstancesOutput)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// StartInstances indicates an expected call of StartInstances
+func (mr *MockClientMockRecorder) StartInstances(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StartInstances", reflect.TypeOf((*MockClient)(nil).StartInstances), arg0)
 }
 
 // RegisterInstancesWithLoadBalancer mocks base method
@@ -515,4 +546,19 @@ func (m *MockClient) GetResourcesPages(input *resourcegroupstaggingapi.GetResour
 func (mr *MockClientMockRecorder) GetResourcesPages(input, fn interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetResourcesPages", reflect.TypeOf((*MockClient)(nil).GetResourcesPages), input, fn)
+}
+
+// GetCallerIdentity mocks base method
+func (m *MockClient) GetCallerIdentity(input *sts.GetCallerIdentityInput) (*sts.GetCallerIdentityOutput, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetCallerIdentity", input)
+	ret0, _ := ret[0].(*sts.GetCallerIdentityOutput)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetCallerIdentity indicates an expected call of GetCallerIdentity
+func (mr *MockClientMockRecorder) GetCallerIdentity(input interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetCallerIdentity", reflect.TypeOf((*MockClient)(nil).GetCallerIdentity), input)
 }

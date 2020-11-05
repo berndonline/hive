@@ -16,6 +16,14 @@ parameters:
   value: ""
 - name: MANAGED_DOMAINS
   value: "[]"
+- name: DISABLED_CONTROLLERS
+  value: "[]"
+- name: DELETE_PROTECTION
+  value: ""
+- name: BACKUP_VELERO_ENABLED
+  value: "false"
+- name: BACKUP_VELERO_NAMESPACE
+  value: openshift-velero
 
 objects:
 - apiVersion: operators.coreos.com/v1alpha1
@@ -54,5 +62,11 @@ objects:
     additionalCertificateAuthoritiesSecretRef:
     - name: ${ADDITIONAL_CERTIFICATE_AUTHORITY}
     managedDomains: "${{MANAGED_DOMAINS}}"
+    disabledControllers: "${{DISABLED_CONTROLLERS}}"
     globalPullSecretRef:
       name: ${GLOBAL_PULL_SECRET}
+    deleteProtection: ${DELETE_PROTECTION}
+    backup:
+      velero:
+        enabled: "${{BACKUP_VELERO_ENABLED}}"
+        namespace: ${BACKUP_VELERO_NAMESPACE}

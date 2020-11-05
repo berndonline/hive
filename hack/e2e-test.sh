@@ -4,11 +4,23 @@ set -e
 
 max_tries=60
 sleep_between_tries=10
+# Set timeout for the cluster deployment to install
+# timeout = sleep_between_cluster_deployment_status_checks * max_cluster_deployment_status_checks
+max_cluster_deployment_status_checks=90
+sleep_between_cluster_deployment_status_checks="1m"
+
 component=hive
 local_hive_image=$(eval "echo $IMAGE_FORMAT")
 export HIVE_IMAGE="${HIVE_IMAGE:-$local_hive_image}"
-export RELEASE_IMAGE="${RELEASE_IMAGE:-registry.svc.ci.openshift.org/${OPENSHIFT_BUILD_NAMESPACE}/release:latest}"
+
+# Replace stable:hive with release:latest in the IMAGE_FORMAT we're given by the ci-operator:
+local_release_image="${HIVE_IMAGE/stable:hive/release:latest}"
+export RELEASE_IMAGE="${RELEASE_IMAGE:-$local_release_image}"
+
 export CLUSTER_NAMESPACE="${CLUSTER_NAMESPACE:-cluster-test}"
+
+echo "Running e2e with HIVE_IMAGE ${HIVE_IMAGE}"
+echo "Running e2e with RELEASE_IMAGE ${RELEASE_IMAGE}"
 
 if ! which kustomize > /dev/null; then
   kustomize_dir="$(mktemp -d)"
@@ -61,9 +73,6 @@ if [ $i -ge ${max_tries} ] ; then
 fi
 
 
-# Install Hive
-make deploy DEPLOY_IMAGE="${HIVE_IMAGE}"
-
 CLOUD_CREDS_DIR="${CLOUD_CREDS_DIR:-/tmp/cluster}"
 
 # Create a new cluster deployment
@@ -72,20 +81,35 @@ export CLUSTER_NAME="${CLUSTER_NAME:-hive-$(uuidgen | tr '[:upper:]' '[:lower:]'
 export ARTIFACT_DIR="${ARTIFACT_DIR:-/tmp}"
 export SSH_PUBLIC_KEY_FILE="${SSH_PUBLIC_KEY_FILE:-${CLOUD_CREDS_DIR}/ssh-publickey}"
 export PULL_SECRET_FILE="${PULL_SECRET_FILE:-${CLOUD_CREDS_DIR}/pull-secret}"
+export HIVE_NS="hive-e2e"
+export HIVE_OPERATOR_NS="hive-operator"
+
+# Install Hive
+DEPLOY_IMAGE="${HIVE_IMAGE}" make deploy
+
 
 function teardown() {
 	echo ""
 	echo ""
+        # Skip tear down if the clusterdeployment is no longer there
+        if ! oc get clusterdeployment ${CLUSTER_NAME}; then
+          return
+        fi
+
+        # This is here for backup. The test-e2e-destroycluster test
+        # should normally delete the clusterdeployemnt. Only if the
+        # test fails before then, this will ensure we at least attempt
+        # to delete the cluster.
 	echo "Deleting ClusterDeployment ${CLUSTER_NAME}"
 	oc delete --wait=false clusterdeployment ${CLUSTER_NAME} || :
 
 	if ! go run "${SRC_ROOT}/contrib/cmd/waitforjob/main.go" --log-level=debug "${CLUSTER_NAME}" "uninstall"
 	then
 		echo "Waiting for uninstall job failed"
-		if oc logs job/${CLUSTER_NAME}-uninstall &> "${ARTIFACT_DIR}/hive_uninstall_job.log"
+		if oc logs job/${CLUSTER_NAME}-uninstall &> "${ARTIFACT_DIR}/hive_uninstall_job_onfailure.log"
 		then
 			echo "************* UNINSTALL JOB LOG *************"
-			cat "${ARTIFACT_DIR}/hive_uninstall_job.log"
+			cat "${ARTIFACT_DIR}/hive_uninstall_job_onfailure.log"
 			echo ""
 			echo ""
 		fi
@@ -93,6 +117,11 @@ function teardown() {
 	fi
 }
 trap 'teardown' EXIT
+
+function save_hive_logs() {
+  oc logs -n "${HIVE_NS}" deployment/hive-controllers > "${ARTIFACT_DIR}/hive-controllers.log"
+  oc logs -n "${HIVE_NS}" deployment/hiveadmission > "${ARTIFACT_DIR}/hiveadmission.log"
+}
 
 echo "Running post-deploy tests"
 make test-e2e-postdeploy
@@ -105,12 +134,11 @@ case "${CLOUD}" in
 "aws")
 	CREDS_FILE="${CLOUD_CREDS_DIR}/.awscred"
 	BASE_DOMAIN="${BASE_DOMAIN:-hive-ci.openshift.com}"
+	EXTRA_CREATE_CLUSTER_ARGS="--aws-user-tags expirationDate=$(date -d '4 hours' --iso=minutes --utc)"
 	;;
 "azure")
 	CREDS_FILE="${CLOUD_CREDS_DIR}/osServicePrincipal.json"
 	BASE_DOMAIN="${BASE_DOMAIN:-ci.azure.devcluster.openshift.com}"
-	# NOTE: No plans to implement DNS management for Azure at this time
-	USE_MANAGED_DNS=false
 	;;
 "gcp")
 	CREDS_FILE="${CLOUD_CREDS_DIR}/gce.json"
@@ -165,7 +193,7 @@ while [ $i -le ${max_tries} ]; do
 
   GET_BY_SHORT_NAME=$(oc get cd)
 
-  if echo "${GET_BY_SHORT_NAME}" | grep 'BASEDOMAIN' ; then
+  if echo "${GET_BY_SHORT_NAME}" | grep 'INFRAID' ; then
     echo "Success"
     break
   else
@@ -184,28 +212,52 @@ fi
 sleep 120
 
 echo "Deployments in hive namespace"
-oc get deployments -n hive
+oc get deployments -n ${HIVE_NS}
 echo ""
 echo "Pods in hive namespace"
-oc get pods -n hive
+oc get pods -n ${HIVE_NS}
+echo ""
+echo "Pods in cluster namespace"
+oc get pods -n ${CLUSTER_NAMESPACE}
 echo ""
 echo "Events in hive namespace"
-oc get events -n hive
+oc get events -n ${HIVE_NS}
+echo ""
+echo "Events in cluster namespace"
+oc get events -n ${CLUSTER_NAMESPACE}
 
-echo "Waiting for install job to start and complete"
-
+echo "Waiting for the ClusterDeployment ${CLUSTER_NAME} to install"
 INSTALL_RESULT=""
-if go run "${SRC_ROOT}/contrib/cmd/waitforjob/main.go" "${CLUSTER_NAME}" "install"
+
+i=1
+while [ $i -le ${max_cluster_deployment_status_checks} ]; do
+  IS_CLUSTER_DEPLOYMENT_INSTALLED=$(oc get cd ${CLUSTER_NAME} -n ${CLUSTER_NAMESPACE} -o json | jq .spec.installed )
+  if [[ "${IS_CLUSTER_DEPLOYMENT_INSTALLED}" == "true" ]] ; then
+    INSTALL_RESULT="success"
+    break
+  fi
+  sleep ${sleep_between_cluster_deployment_status_checks}
+  echo "Still waiting for the ClusterDeployment ${CLUSTER_NAME} to install. Status check #${i}/${max_cluster_deployment_status_checks}... "
+  i=$((i + 1))
+done
+
+if [[ "${INSTALL_RESULT}" == "success" ]]
 then
-	echo "ClusterDeployment ${CLUSTER_NAME} was installed successfully"
-	INSTALL_RESULT="success"
+  echo "ClusterDeployment ${CLUSTER_NAME} was installed successfully"
+else
+  echo "Timed out waiting for the ClusterDeployment ${CLUSTER_NAME} to install"
 fi
 
 # Capture install logs
-if INSTALL_JOB_NAME=$(oc get job -l "hive.openshift.io/cluster-deployment-name=${CLUSTER_NAME},hive.openshift.io/install=true" -o name) && [ "${INSTALL_JOB_NAME}" ]
+if IMAGESET_JOB_NAME=$(oc get job -l "hive.openshift.io/cluster-deployment-name=${CLUSTER_NAME},hive.openshift.io/imageset=true" -o name -n ${CLUSTER_NAMESPACE}) && [ "${IMAGESET_JOB_NAME}" ]
 then
-	oc logs -c hive ${INSTALL_JOB_NAME} &> "${ARTIFACT_DIR}/hive_install_job.log" || true
-	oc get ${INSTALL_JOB_NAME} -o yaml &> "${ARTIFACT_DIR}/hive_install_job.yaml" || true
+	oc logs -c hive -n ${CLUSTER_NAMESPACE} ${IMAGESET_JOB_NAME} &> "${ARTIFACT_DIR}/hive_imageset_job.log" || true
+	oc get ${IMAGESET_JOB_NAME} -n ${CLUSTER_NAMESPACE} -o yaml &> "${ARTIFACT_DIR}/hive_imageset_job.yaml" || true
+fi
+if INSTALL_JOB_NAME=$(oc get job -l "hive.openshift.io/cluster-deployment-name=${CLUSTER_NAME},hive.openshift.io/install=true" -o name -n ${CLUSTER_NAMESPACE}) && [ "${INSTALL_JOB_NAME}" ]
+then
+	oc logs -c hive -n ${CLUSTER_NAMESPACE} ${INSTALL_JOB_NAME} &> "${ARTIFACT_DIR}/hive_install_job.log" || true
+	oc get ${INSTALL_JOB_NAME} -n ${CLUSTER_NAMESPACE} -o yaml &> "${ARTIFACT_DIR}/hive_install_job.yaml" || true
 fi
 oc get clusterdeployment -A -o yaml &> "${ARTIFACT_DIR}/hive_clusterdeployment.yaml" || true
 oc get clusterimageset -o yaml &> "${ARTIFACT_DIR}/hive_clusterimagesets.yaml" || true
@@ -226,3 +278,12 @@ fi
 
 echo "Running post-install tests"
 make test-e2e-postinstall
+
+echo "Running destroy test"
+make test-e2e-destroycluster
+
+echo "Saving hive logs"
+save_hive_logs
+
+echo "Uninstalling hive and validating cleanup"
+make test-e2e-uninstallhive

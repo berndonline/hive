@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"testing"
 
+	"github.com/go-logr/logr"
 	"github.com/golang/mock/gomock"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -313,7 +316,7 @@ func TestDNSEndpointReconcile(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mockCtrl := gomock.NewController(t)
 			defer mockCtrl.Finish()
-			logger := log.WithField("controller", controllerName)
+			logger := log.WithField("controller", ControllerName)
 			fakeClient := fake.NewFakeClient(tc.dnsZone)
 			mockQuery := mock.NewMockQuery(mockCtrl)
 			if tc.configureQuery != nil {
@@ -382,7 +385,19 @@ func (fm *fakeManager) Add(mgr manager.Runnable) error {
 	}
 	return nil
 }
+func (*fakeManager) Elected() <-chan struct{} {
+	panic("not implemented")
+}
 func (*fakeManager) SetFields(interface{}) error {
+	panic("not implemented")
+}
+func (*fakeManager) AddMetricsExtraHandler(path string, handler http.Handler) error {
+	panic("not implemented")
+}
+func (*fakeManager) AddHealthzCheck(name string, check healthz.Checker) error {
+	panic("not implemented")
+}
+func (*fakeManager) AddReadyzCheck(name string, check healthz.Checker) error {
 	panic("not implemented")
 }
 func (*fakeManager) Start(<-chan struct{}) error {
@@ -414,6 +429,10 @@ func (*fakeManager) GetAPIReader() client.Reader {
 	panic("not implemented")
 }
 func (*fakeManager) GetWebhookServer() *webhook.Server {
+	panic("not implemented")
+}
+
+func (*fakeManager) GetLogger() logr.Logger {
 	panic("not implemented")
 }
 

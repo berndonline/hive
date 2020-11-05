@@ -318,7 +318,7 @@ func TestRemoteClusterIngressReconcile(t *testing.T) {
 			rcd := &ReconcileRemoteClusterIngress{
 				Client:  fakeClient,
 				scheme:  scheme.Scheme,
-				logger:  log.WithField("controller", controllerName),
+				logger:  log.WithField("controller", ControllerName),
 				kubeCLI: helper,
 			}
 			_, err := rcd.Reconcile(reconcile.Request{
@@ -416,7 +416,7 @@ func TestRemoteClusterIngressReconcileConditions(t *testing.T) {
 			rcd := &ReconcileRemoteClusterIngress{
 				Client:  fakeClient,
 				scheme:  scheme.Scheme,
-				logger:  log.WithField("controller", controllerName),
+				logger:  log.WithField("controller", ControllerName),
 				kubeCLI: helper,
 			}
 			_, err := rcd.Reconcile(reconcile.Request{
@@ -554,8 +554,8 @@ func testSecretForCertificateBundle(cb hivev1.CertificateBundleSpec) corev1.Secr
 			Kind: "Secret",
 		},
 		Data: map[string][]byte{
-			"tls.crt": []byte("SOME_FAKE_CERTIFICATE_DATA"),
-			"tls.key": []byte("SOME_FAKE_CERTIFICATE_KEY_DATA"),
+			constants.TLSCrtSecretKey: []byte("SOME_FAKE_CERTIFICATE_DATA"),
+			constants.TLSKeySecretKey: []byte("SOME_FAKE_CERTIFICATE_KEY_DATA"),
 		},
 	}
 	return secret

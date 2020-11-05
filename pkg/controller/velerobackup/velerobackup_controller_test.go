@@ -3,12 +3,14 @@ package velerobackup
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/golang/mock/gomock"
+	velerov1 "github.com/heptio/velero/pkg/apis/velero/v1"
 	corev1 "k8s.io/api/core/v1"
 
-	velerov1 "github.com/heptio/velero/pkg/apis/velero/v1"
 	"github.com/openshift/hive/pkg/apis"
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
 	controllerutils "github.com/openshift/hive/pkg/controller/utils"
@@ -16,15 +18,68 @@ import (
 	testclusterdeployment "github.com/openshift/hive/pkg/test/clusterdeployment"
 	testdnszone "github.com/openshift/hive/pkg/test/dnszone"
 
-	"github.com/openshift/hive/pkg/test/generic"
-	testsyncset "github.com/openshift/hive/pkg/test/syncset"
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/openshift/hive/pkg/test/generic"
+	"github.com/openshift/hive/pkg/test/manager/mock"
+	testsyncset "github.com/openshift/hive/pkg/test/syncset"
 )
+
+const (
+	veleroNSEnvKey = "HIVE_VELERO_NAMESPACE"
+)
+
+func TestNewReconciler(t *testing.T) {
+	apis.AddToScheme(scheme.Scheme)
+	velerov1.AddToScheme(scheme.Scheme)
+
+	tests := []struct {
+		name                    string
+		expectedVeleroNamespace string
+		expectedError           error
+		setup                   func()
+	}{
+		{
+			name:                    "Default",
+			expectedVeleroNamespace: "velero",
+			setup: func() {
+				os.Unsetenv(veleroNSEnvKey)
+			},
+		},
+		{
+			name:                    "Velero project set",
+			expectedVeleroNamespace: "openshift-velero",
+			setup: func() {
+				os.Setenv(veleroNSEnvKey, "openshift-velero")
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Arrange
+			mockCtrl := gomock.NewController(t)
+			defer mockCtrl.Finish()
+			mockManager := mock.NewMockManager(mockCtrl)
+			mockManager.EXPECT().GetScheme().Return(nil)
+			test.setup()
+
+			// Act
+			tmpResult, actualError := NewReconciler(mockManager, nil)
+			actualResult := tmpResult.(*ReconcileBackup)
+
+			// Assert
+			assert.Equal(t, test.expectedVeleroNamespace, actualResult.veleroNamespace, "Velero Namespace set incorrectly")
+			assert.Equal(t, test.expectedError, actualError, "unexpected error returned")
+		})
+	}
+}
 
 func TestReconcile(t *testing.T) {
 	apis.AddToScheme(scheme.Scheme)
@@ -69,7 +124,9 @@ func TestReconcile(t *testing.T) {
 						testclusterdeployment.Build(clusterDeploymentBase()),
 						testsyncset.Build(syncSetBase()),
 						testdnszone.Build(dnsZoneBase()),
-					}))),
+					})),
+					testcheckpoint.WithResourceVersion("1"),
+				),
 			},
 		},
 		{
@@ -87,7 +144,9 @@ func TestReconcile(t *testing.T) {
 					testcheckpoint.WithLastBackupChecksum(calculateRuntimeObjectsChecksum(
 						[]runtime.Object{
 							testclusterdeployment.Build(clusterDeploymentBase()),
-						}))),
+						})),
+					testcheckpoint.WithResourceVersion("1"),
+				),
 			},
 			expectedResult: reconcile.Result{},
 			expectedObjects: []runtime.Object{
@@ -98,7 +157,9 @@ func TestReconcile(t *testing.T) {
 					testcheckpoint.WithLastBackupChecksum(calculateRuntimeObjectsChecksum(
 						[]runtime.Object{
 							testclusterdeployment.Build(clusterDeploymentBase()),
-						}))),
+						})),
+					testcheckpoint.WithResourceVersion("1"),
+				),
 			},
 		},
 		{
@@ -117,7 +178,9 @@ func TestReconcile(t *testing.T) {
 					testcheckpoint.WithLastBackupChecksum(calculateRuntimeObjectsChecksum(
 						[]runtime.Object{
 							testclusterdeployment.Build(clusterDeploymentBase()),
-						}))),
+						})),
+					testcheckpoint.WithResourceVersion("1"),
+				),
 			},
 			expectedResult: reconcile.Result{
 				RequeueAfter: ((3 * time.Minute) - twoMinuteDuration),
@@ -131,7 +194,9 @@ func TestReconcile(t *testing.T) {
 					testcheckpoint.WithLastBackupChecksum(calculateRuntimeObjectsChecksum(
 						[]runtime.Object{
 							testclusterdeployment.Build(clusterDeploymentBase()),
-						}))),
+						})),
+					testcheckpoint.WithResourceVersion("1"),
+				),
 			},
 		},
 		{
@@ -147,7 +212,9 @@ func TestReconcile(t *testing.T) {
 				testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum(calculateRuntimeObjectsChecksum(
 					[]runtime.Object{
 						testclusterdeployment.Build(clusterDeploymentBase()),
-					}))),
+					})),
+					testcheckpoint.WithResourceVersion("1"),
+				),
 			},
 			expectedResult: reconcile.Result{},
 			expectedObjects: []runtime.Object{
@@ -157,7 +224,10 @@ func TestReconcile(t *testing.T) {
 					[]runtime.Object{
 						testclusterdeployment.Build(clusterDeploymentBase()),
 						testsyncset.Build(syncSetBase()),
-					}))),
+					})),
+					testcheckpoint.WithResourceVersion("2"),
+					testcheckpoint.WithTypeMeta(),
+				),
 			},
 		},
 		{
@@ -173,7 +243,9 @@ func TestReconcile(t *testing.T) {
 				testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum(calculateRuntimeObjectsChecksum(
 					[]runtime.Object{
 						testclusterdeployment.Build(clusterDeploymentBase()),
-					}))),
+					})),
+					testcheckpoint.WithResourceVersion("1"),
+				),
 			},
 			expectedResult: reconcile.Result{},
 			expectedObjects: []runtime.Object{
@@ -183,7 +255,10 @@ func TestReconcile(t *testing.T) {
 					[]runtime.Object{
 						testclusterdeployment.Build(clusterDeploymentBase()),
 						testsyncset.Build(syncSetBase()),
-					}))),
+					})),
+					testcheckpoint.WithResourceVersion("2"),
+					testcheckpoint.WithTypeMeta(),
+				),
 			},
 		},
 	}
@@ -197,7 +272,7 @@ func TestReconcile(t *testing.T) {
 
 			// Act
 			actualResult, actualError := r.Reconcile(test.request)
-			actualObjects, err := controllerutils.GetRuntimeObjects(r, types, namespace)
+			actualObjects, err := controllerutils.ListRuntimeObjects(r, types, client.InNamespace(namespace))
 			lastBackupName, lastBackupTimestamp := ignoreUncomparedFields(test.expectedObjects, actualObjects)
 
 			// Assert
@@ -277,7 +352,7 @@ func TestGetRuntimeObjects(t *testing.T) {
 			r := fakeClientReconcileBackup(test.existingObjects)
 
 			// Act
-			actualObjects, actualError := controllerutils.GetRuntimeObjects(r, hiveNamespaceScopedListTypes, namespace)
+			actualObjects, actualError := controllerutils.ListRuntimeObjects(r, hiveNamespaceScopedListTypes, client.InNamespace(namespace))
 
 			// Assert
 			assert.NoError(t, actualError)
@@ -308,7 +383,7 @@ func TestGetNamespaceCheckpoint(t *testing.T) {
 			name:               "Existing Checkpoint",
 			expectedFound:      true,
 			existingObjects:    []runtime.Object{testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL"))},
-			expectedCheckpoint: testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL")),
+			expectedCheckpoint: testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL"), testcheckpoint.WithTypeMeta()),
 			expectedError:      nil,
 		},
 	}
@@ -346,17 +421,17 @@ func TestCreateOrUpdateNamespaceCheckpoint(t *testing.T) {
 			found:              false,
 			checkpoint:         testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL")),
 			existingObjects:    emptyRuntimeObjectSlice,
-			expectedCheckpoint: testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL")),
+			expectedCheckpoint: testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL"), testcheckpoint.WithResourceVersion("1"), testcheckpoint.WithTypeMeta()),
 			expectedError:      nil,
 		},
 		{
 			name:       "Update Checkpoint",
 			found:      true,
-			checkpoint: testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL-AFTER")),
+			checkpoint: testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL-AFTER"), testcheckpoint.WithResourceVersion("1")),
 			existingObjects: []runtime.Object{
-				testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL-BEFORE")),
+				testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL-BEFORE"), testcheckpoint.WithResourceVersion("1")),
 			},
-			expectedCheckpoint: testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL-AFTER")),
+			expectedCheckpoint: testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL-AFTER"), testcheckpoint.WithResourceVersion("2"), testcheckpoint.WithTypeMeta()),
 			expectedError:      nil,
 		},
 		{
@@ -366,7 +441,7 @@ func TestCreateOrUpdateNamespaceCheckpoint(t *testing.T) {
 			existingObjects: []runtime.Object{
 				testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL-BEFORE")),
 			},
-			expectedCheckpoint: testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL-BEFORE")),
+			expectedCheckpoint: testcheckpoint.Build(checkpointBase(), testcheckpoint.WithLastBackupChecksum("NOTREAL-BEFORE"), testcheckpoint.WithTypeMeta()),
 			expectedError:      statusErr,
 		},
 		{

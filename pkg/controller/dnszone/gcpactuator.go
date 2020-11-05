@@ -85,18 +85,33 @@ func (a *GCPActuator) Create() error {
 
 	logger.Debug("Managed zone successfully created")
 	a.managedZone = managedZone
+	if err := a.modifyStatus(); err != nil {
+		logger.WithError(err).Error("failed to sync DNSZone status fields")
+		return err
+	}
+
 	return nil
 }
 
 // Delete implements the Delete call of the actuator interface
 func (a *GCPActuator) Delete() error {
-	if a.managedZone == nil {
-		return errors.New("managedZone is unpopulated")
+	if a.dnsZone.Status.GCP == nil {
+		return errors.New("deleting non-GCP DNSZone with GCP actuator")
+	}
+	if a.dnsZone.Status.GCP.ZoneName == nil {
+		return errors.New("zone name not found in DNSZone status")
+	}
+	zoneName := *a.dnsZone.Status.GCP.ZoneName
+
+	logger := a.logger.WithField("zone", a.dnsZone.Spec.Zone).WithField("zoneName", zoneName)
+
+	logger.Info("Deleting recordsets in managedzone")
+	if err := DeleteGCPRecordSets(a.gcpClient, a.dnsZone, logger); err != nil {
+		return err
 	}
 
-	logger := a.logger.WithField("zone", a.dnsZone.Spec.Zone).WithField("zoneName", a.managedZone.Name)
 	logger.Info("Deleting managed zone")
-	err := a.gcpClient.DeleteManagedZone(a.managedZone.Name)
+	err := a.gcpClient.DeleteManagedZone(zoneName)
 	if err != nil {
 		logLevel := log.ErrorLevel
 		if gcpErr, ok := err.(*googleapi.Error); ok && gcpErr.Code == http.StatusBadRequest {
@@ -112,6 +127,37 @@ func (a *GCPActuator) Delete() error {
 	return err
 }
 
+// DeleteGCPRecordSets will delete all non-essential DNS records in the DNSZone provided
+func DeleteGCPRecordSets(gcpClient gcpclient.Client, dnsZone *hivev1.DNSZone, logger log.FieldLogger) error {
+	listOpts := gcpclient.ListResourceRecordSetsOptions{}
+	for {
+		listOutput, err := gcpClient.ListResourceRecordSets(*dnsZone.Status.GCP.ZoneName, listOpts)
+		if err != nil {
+			return err
+		}
+		var recordSetsToDelete []*dns.ResourceRecordSet
+		for _, recordSet := range listOutput.Rrsets {
+			// Ignore the 2 recordsets that are created with the managed zone and that cannot be deleted
+			if n, t := recordSet.Name, recordSet.Type; n == controllerutils.Dotted(dnsZone.Spec.Zone) && (t == "NS" || t == "SOA") {
+				continue
+			}
+			logger.WithField("name", recordSet.Name).WithField("type", recordSet.Type).Info("recordset set for deletion")
+			recordSetsToDelete = append(recordSetsToDelete, recordSet)
+		}
+		if len(recordSetsToDelete) > 0 {
+			logger.WithField("count", len(recordSetsToDelete)).Info("deleting recordsets")
+			if err := gcpClient.DeleteResourceRecordSets(*dnsZone.Status.GCP.ZoneName, recordSetsToDelete); err != nil {
+				return err
+			}
+		}
+		if listOutput.NextPageToken == "" {
+			break
+		}
+		listOpts.PageToken = listOutput.NextPageToken
+	}
+	return nil
+}
+
 // Exists implements the Exists call of the actuator interface
 func (a *GCPActuator) Exists() (bool, error) {
 	return a.managedZone != nil, nil
@@ -123,8 +169,8 @@ func (a *GCPActuator) UpdateMetadata() error {
 	return nil
 }
 
-// ModifyStatus implements the ModifyStatus call of the actuator interface
-func (a *GCPActuator) ModifyStatus() error {
+// modifyStatus updates the DnsZone's status with GCP specific information.
+func (a *GCPActuator) modifyStatus() error {
 	if a.managedZone == nil {
 		return errors.New("managedZone is unpopulated")
 	}
@@ -180,7 +226,17 @@ func (a *GCPActuator) Refresh() error {
 
 	logger.Debug("Found managed zone")
 	a.managedZone = resp
+	if err := a.modifyStatus(); err != nil {
+		logger.WithError(err).Error("failed to sync DNSZone status fields")
+		return err
+	}
+
 	return nil
+}
+
+// SetConditionsForError sets conditions on the dnszone given a specific error. Returns true if conditions changed.
+func (a *GCPActuator) SetConditionsForError(err error) bool {
+	return false // Not implemented for GCP yet.
 }
 
 func generateManagedZoneName(zone string) string {

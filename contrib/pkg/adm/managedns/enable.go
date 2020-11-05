@@ -18,7 +18,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/tools/cache"
 	clientwatch "k8s.io/client-go/tools/watch"
-	"k8s.io/kubernetes/pkg/kubectl"
+	"k8s.io/kubectl/pkg/polymorphichelpers"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -29,10 +29,11 @@ import (
 
 	hiveutils "github.com/openshift/hive/contrib/pkg/utils"
 	awsutils "github.com/openshift/hive/contrib/pkg/utils/aws"
+	azureutils "github.com/openshift/hive/contrib/pkg/utils/azure"
 	gcputils "github.com/openshift/hive/contrib/pkg/utils/gcp"
 	"github.com/openshift/hive/pkg/apis"
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1"
-	hiveclient "github.com/openshift/hive/pkg/client/clientset-generated/clientset"
+	hiveclient "github.com/openshift/hive/pkg/client/clientset/versioned"
 	"github.com/openshift/hive/pkg/constants"
 	"github.com/openshift/hive/pkg/resource"
 )
@@ -49,7 +50,7 @@ the ExternalDNS section of HiveConfig.
 const (
 	cloudAWS                = "aws"
 	cloudGCP                = "gcp"
-	hiveNamespace           = "hive"
+	cloudAzure              = "azure"
 	hiveAdmissionDeployment = "hiveadmission"
 	hiveConfigName          = "hive"
 	waitTime                = time.Minute * 2
@@ -60,6 +61,8 @@ type Options struct {
 	Cloud     string
 	CredsFile string
 	homeDir   string
+
+	AzureResourceGroup string
 
 	dynamicClient dynamic.Interface
 	hiveClient    *hiveclient.Clientset
@@ -95,8 +98,9 @@ func NewEnableManageDNSCommand() *cobra.Command {
 	}
 
 	flags := cmd.Flags()
-	flags.StringVar(&opt.Cloud, "cloud", cloudAWS, "Cloud provider: aws(default)|gcp)")
+	flags.StringVar(&opt.Cloud, "cloud", cloudAWS, "Cloud provider: aws(default)|gcp|azure)")
 	flags.StringVar(&opt.CredsFile, "creds-file", "", "Cloud credentials file (defaults vary depending on cloud)")
+	flags.StringVar(&opt.AzureResourceGroup, "azure-resource-group-name", "os4-common", "Azure Resource Group (Only applicable if --cloud azure)")
 	return cmd
 }
 
@@ -127,7 +131,7 @@ func (o *Options) Run(args []string) error {
 
 	// Update the current HiveConfig, which should always exist as the operator will
 	// create a default one once run.
-	hc, err := o.hiveClient.HiveV1().HiveConfigs().Get(hiveConfigName, metav1.GetOptions{})
+	hc, err := o.hiveClient.HiveV1().HiveConfigs().Get(context.Background(), hiveConfigName, metav1.GetOptions{})
 	if err != nil {
 		log.WithError(err).Fatal("error looking up HiveConfig 'hive'")
 	}
@@ -157,6 +161,15 @@ func (o *Options) Run(args []string) error {
 		dnsConf.GCP = &hivev1.ManageDNSGCPConfig{
 			CredentialsSecretRef: corev1.LocalObjectReference{Name: credsSecret.Name},
 		}
+	case cloudAzure:
+		credsSecret, err = o.generateAzureCredentialsSecret()
+		if err != nil {
+			log.WithError(err).Fatal("error generating manageDNS credentials secret")
+		}
+		dnsConf.Azure = &hivev1.ManageDNSAzureConfig{
+			CredentialsSecretRef: corev1.LocalObjectReference{Name: credsSecret.Name},
+			ResourceGroupName:    o.AzureResourceGroup,
+		}
 	default:
 		log.WithField("cloud", o.Cloud).Fatal("unsupported cloud")
 	}
@@ -164,13 +177,18 @@ func (o *Options) Run(args []string) error {
 	log.Debug("adding new ManagedDomain config to existing HiveConfig")
 	hc.Spec.ManagedDomains = append(hc.Spec.ManagedDomains, dnsConf)
 
+	hiveNSName := hc.Spec.TargetNamespace
+	if hiveNSName == "" {
+		hiveNSName = constants.DefaultHiveNamespace
+	}
+
 	log.Infof("created cloud credentials secret: %s", credsSecret.Name)
-	credsSecret.Namespace = hiveNamespace
+	credsSecret.Namespace = hiveNSName
 	if _, err := rh.ApplyRuntimeObject(credsSecret, scheme.Scheme); err != nil {
 		log.WithError(err).Fatal("failed to save generated secret")
 	}
 
-	_, err = o.hiveClient.HiveV1().HiveConfigs().Update(hc)
+	_, err = o.hiveClient.HiveV1().HiveConfigs().Update(context.Background(), hc, metav1.UpdateOptions{})
 	if err != nil {
 		log.WithError(err).Fatal("error updating HiveConfig")
 	}
@@ -186,7 +204,7 @@ func (o *Options) Run(args []string) error {
 		log.WithError(err).Fatal("gave up waiting for HiveConfig to be processed")
 	}
 
-	if err := waitForHiveAdmissionPods(o.dynamicClient); err != nil {
+	if err := waitForHiveAdmissionPods(o.dynamicClient, hiveNSName); err != nil {
 		log.WithError(err).Fatal("hive admission pods never became available")
 	}
 
@@ -194,25 +212,25 @@ func (o *Options) Run(args []string) error {
 	return nil
 }
 
-func waitForHiveAdmissionPods(dynClient dynamic.Interface) error {
+func waitForHiveAdmissionPods(dynClient dynamic.Interface, hiveNSName string) error {
 	resourceName := "deployments"
 	gvr := appsv1.SchemeGroupVersion.WithResource(resourceName)
 
 	log.Info("waiting for new hiveadmission pods to deploy")
 
-	statusViewer := &kubectl.DeploymentStatusViewer{}
+	statusViewer := &polymorphichelpers.DeploymentStatusViewer{}
 
 	fieldSelector := fields.OneTermEqualSelector("metadata.name", hiveAdmissionDeployment).String()
 
 	lw := &cache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 			options.FieldSelector = fieldSelector
-			return dynClient.Resource(gvr).Namespace(constants.HiveNamespace).List(options)
+			return dynClient.Resource(gvr).Namespace(hiveNSName).List(context.Background(), options)
 
 		},
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 			options.FieldSelector = fieldSelector
-			return dynClient.Resource(gvr).Namespace(constants.HiveNamespace).Watch(options)
+			return dynClient.Resource(gvr).Namespace(hiveNSName).Watch(context.Background(), options)
 		},
 	}
 
@@ -254,11 +272,11 @@ func waitForHiveConfigToBeProcessed(hiveClient *hiveclient.Clientset) error {
 	lw := &cache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 			options.FieldSelector = fieldSelector
-			return hiveClient.HiveV1().HiveConfigs().List(options)
+			return hiveClient.HiveV1().HiveConfigs().List(context.Background(), options)
 		},
 		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
 			options.FieldSelector = fieldSelector
-			return hiveClient.HiveV1().HiveConfigs().Watch(options)
+			return hiveClient.HiveV1().HiveConfigs().Watch(context.Background(), options)
 		},
 	}
 
@@ -300,8 +318,7 @@ func (o *Options) generateAWSCredentialsSecret() (*corev1.Secret, error) {
 			APIVersion: corev1.SchemeGroupVersion.String(),
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("aws-dns-creds-%s", uuid.New().String()[:5]),
-			Namespace: hiveNamespace,
+			Name: fmt.Sprintf("aws-dns-creds-%s", uuid.New().String()[:5]),
 		},
 		Type: corev1.SecretTypeOpaque,
 		StringData: map[string]string{
@@ -322,8 +339,7 @@ func (o *Options) generateGCPCredentialsSecret() (*corev1.Secret, error) {
 			APIVersion: corev1.SchemeGroupVersion.String(),
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("gcp-dns-creds-%s", uuid.New().String()[:5]),
-			Namespace: hiveNamespace,
+			Name: fmt.Sprintf("gcp-dns-creds-%s", uuid.New().String()[:5]),
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
@@ -331,7 +347,28 @@ func (o *Options) generateGCPCredentialsSecret() (*corev1.Secret, error) {
 		},
 	}, nil
 }
-func (o *Options) getResourceHelper() (*resource.Helper, error) {
+
+func (o *Options) generateAzureCredentialsSecret() (*corev1.Secret, error) {
+	spFileContents, err := azureutils.GetCreds(o.CredsFile)
+	if err != nil {
+		return nil, err
+	}
+	return &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Secret",
+			APIVersion: corev1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("azure-dns-creds-%s", uuid.New().String()[:5]),
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			constants.AzureCredentialsName: spFileContents,
+		},
+	}, nil
+}
+
+func (o *Options) getResourceHelper() (resource.Helper, error) {
 	cfg, err := config.GetConfig()
 	if err != nil {
 		log.WithError(err).Error("Cannot get client config")
